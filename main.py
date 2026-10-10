@@ -346,6 +346,30 @@ def register(
         )
     return professional_response(db_prof)
 
+
+@app.post(
+    "/api/v1/auth/login",
+    response_model=schemas.ProfessionalResponse,
+)
+def login(
+    firebase_token: dict[str, Any] = Depends(verify_firebase_token),
+    db: Session = Depends(get_db),
+):
+    professional = (
+        db.query(models.ProfessionalModel)
+        .filter(
+            models.ProfessionalModel.firebase_uid == firebase_token["uid"]
+        )
+        .first()
+    )
+    if professional is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Não existe um profissional vinculado a este usuário Firebase",
+        )
+    return professional_response(professional)
+
+
 @app.post("/api/v1/subscription/verify")
 def verify_subscription(
     sub_data: schemas.SubscriptionVerifyRequest,
