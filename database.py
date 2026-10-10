@@ -4,7 +4,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.schema import CreateColumn
 
-# A URL do Neon PostgreSQL será pega nas variáveis de ambiente do Render
+# A URL do PostgreSQL deve ser configurada na variável de ambiente DATABASE_URL.
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://usuario:senha@host/dbname?sslmode=require")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
