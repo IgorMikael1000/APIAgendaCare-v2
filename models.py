@@ -4,7 +4,6 @@ from database import Base
 class ProfessionalModel(Base):
     __tablename__ = "professionals"
     id = Column(String(255), primary_key=True, index=True)
-    device_id = Column(String(255), unique=True, index=True)
     firebase_uid = Column(String(255), unique=True, nullable=True)
     plan_type = Column(String(50), default="FREE")
     trial_ends_at = Column(DateTime(timezone=True), nullable=True)
@@ -17,9 +16,15 @@ class ProfessionalModel(Base):
     specialty_id = Column(String(255), nullable=True)
     professional_register = Column(String(100))
     cpf = Column(String(20), unique=True, nullable=False)
-    password_hash = Column(String(255))
     phone = Column(String(50), unique=True)
     signature_url = Column(Text)
+
+
+class TrialDeviceModel(Base):
+    __tablename__ = "dispositivos_trial"
+    android_id = Column(String(255), primary_key=True)
+    data_ativacao = Column(DateTime(timezone=True), nullable=False)
+
 
 class PatientModel(Base):
     __tablename__ = "patients"

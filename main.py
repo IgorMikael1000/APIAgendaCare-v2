@@ -1,15 +1,13 @@
 import base64
 import binascii
-import hmac
 import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import quote
 
-import bcrypt
 import firebase_admin
 import google.auth
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -27,7 +25,7 @@ from fastapi import (
 )
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
-from sqlalchemy import or_
+from sqlalchemy import func, or_, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from database import create_or_update_schema, get_db
@@ -35,7 +33,7 @@ import models
 import schemas
 from schemas import AppointmentSchema, EvolutionRecordSchema
 
-# Cria tabelas novas e aplica alterações aditivas às tabelas existentes
+# Cria tabelas novas e aplica alterações aditivas às tabelas existentes.
 create_or_update_schema()
 
 app = FastAPI(title="AgendaCare API", version="1.0.0")
@@ -63,12 +61,11 @@ def get_firebase_app():
                 return firebase_admin.initialize_app()
 
 
-def get_current_user(
+def verify_firebase_token(
     bearer_credentials: Optional[HTTPAuthorizationCredentials] = Depends(
         bearer_scheme
     ),
-    db: Session = Depends(get_db),
-) -> models.ProfessionalModel:
+) -> dict[str, Any]:
     if bearer_credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -89,6 +86,12 @@ def get_current_user(
             detail="Token Firebase inválido ou expirado",
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+    except exceptions.FirebaseError as exc:
+        logger.exception("Não foi possível validar o token no Firebase")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Não foi possível validar o token no Firebase",
+        ) from exc
 
     firebase_uid = decoded_token.get("uid")
     if not firebase_uid:
@@ -98,9 +101,18 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    return decoded_token
+
+
+def get_current_user(
+    firebase_token: dict[str, Any] = Depends(verify_firebase_token),
+    db: Session = Depends(get_db),
+) -> models.ProfessionalModel:
     current_user = (
         db.query(models.ProfessionalModel)
-        .filter(models.ProfessionalModel.firebase_uid == firebase_uid)
+        .filter(
+            models.ProfessionalModel.firebase_uid == firebase_token["uid"]
+        )
         .first()
     )
     if current_user is None:
@@ -110,11 +122,6 @@ def get_current_user(
         )
     return current_user
 
-def hash_password(password: str) -> str:
-    password_bytes = password.encode("utf-8")[:72]
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password_bytes, salt).decode("utf-8")
-
 def professional_response(prof: models.ProfessionalModel):
     if not prof.cpf:
         raise HTTPException(
@@ -123,6 +130,7 @@ def professional_response(prof: models.ProfessionalModel):
         )
 
     expiration = subscription_expiration(prof)
+    subscription_expired = is_subscription_expired(prof)
     return {
         "id": prof.id,
         "name": prof.name,
@@ -139,7 +147,8 @@ def professional_response(prof: models.ProfessionalModel):
             prof.subscription_expires_at
         ),
         "expirationDate": format_expiration_date(expiration),
-        "isSubscriptionExpired": is_subscription_expired(prof),
+        "isSubscriptionExpired": subscription_expired,
+        "bloquear_app": subscription_expired,
     }
 
 
@@ -207,23 +216,37 @@ def read_root():
     "/api/v1/auth/register",
     response_model=schemas.ProfessionalResponse,
 )
-def register(prof: schemas.ProfessionalCreate, db: Session = Depends(get_db)):
-    existing_device = (
-        db.query(models.ProfessionalModel.id)
-        .filter(models.ProfessionalModel.device_id == prof.deviceId)
-        .first()
-    )
-    if existing_device:
+def register(
+    prof: schemas.ProfessionalCreate,
+    firebase_token: dict[str, Any] = Depends(verify_firebase_token),
+    db: Session = Depends(get_db),
+):
+    firebase_uid = firebase_token["uid"]
+    firebase_email = firebase_token.get("email")
+    if not firebase_email:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="O token Firebase não contém um e-mail verificado",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    firebase_email = firebase_email.strip().casefold()
+    if prof.email.strip().casefold() != firebase_email:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Este dispositivo já utilizou o período de teste gratuito.",
+            detail="O e-mail informado não corresponde ao usuário autenticado",
+        )
+
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:android_id))"),
+            {"android_id": prof.android_id},
         )
 
     duplicate_credentials = [
-        models.ProfessionalModel.email == prof.email,
+        func.lower(models.ProfessionalModel.email) == firebase_email,
     ]
-    if prof.cpf is not None:
-        duplicate_credentials.append(models.ProfessionalModel.cpf == prof.cpf)
+    cpf = prof.cpf.strip()
+    duplicate_credentials.append(models.ProfessionalModel.cpf == cpf)
     if prof.phone is not None:
         duplicate_credentials.append(models.ProfessionalModel.phone == prof.phone)
 
@@ -245,20 +268,36 @@ def register(prof: schemas.ProfessionalCreate, db: Session = Depends(get_db)):
             detail="ID de profissional já cadastrado no sistema",
         )
 
+    existing_device = (
+        db.query(models.TrialDeviceModel.android_id)
+        .filter(models.TrialDeviceModel.android_id == prof.android_id)
+        .first()
+    )
+    if existing_device:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Este dispositivo já utilizou o período de teste gratuito.",
+        )
+
+    activation_date = datetime.now(timezone.utc)
+    db.add(
+        models.TrialDeviceModel(
+            android_id=prof.android_id,
+            data_ativacao=activation_date,
+        )
+    )
     db_prof = models.ProfessionalModel(
         id=prof.id,
-        device_id=prof.deviceId,
-        firebase_uid=prof.firebaseUid,
+        firebase_uid=firebase_uid,
         plan_type="FREE",
-        trial_ends_at=datetime.now(timezone.utc) + timedelta(days=7),
+        trial_ends_at=activation_date + timedelta(days=7),
         subscription_status="TRIAL",
         name=prof.name,
-        email=prof.email,
+        email=firebase_email,
         specialty=prof.specialty,
         specialty_id=prof.specialtyId,
         professional_register=prof.professionalRegister,
-        cpf=prof.cpf,
-        password_hash=hash_password(prof.password),
+        cpf=cpf,
         phone=prof.phone,
         signature_url=prof.signatureUrl
     )
@@ -268,8 +307,10 @@ def register(prof: schemas.ProfessionalCreate, db: Session = Depends(get_db)):
     except IntegrityError:
         db.rollback()
         existing_device = (
-            db.query(models.ProfessionalModel.id)
-            .filter(models.ProfessionalModel.device_id == prof.deviceId)
+            db.query(models.TrialDeviceModel.android_id)
+            .filter(
+                models.TrialDeviceModel.android_id == prof.android_id
+            )
             .first()
         )
         if existing_device:
@@ -282,90 +323,6 @@ def register(prof: schemas.ProfessionalCreate, db: Session = Depends(get_db)):
             detail="E-mail, CPF, telefone, Firebase UID ou ID já cadastrados no sistema",
         )
     return professional_response(db_prof)
-
-@app.post(
-    "/api/v1/auth/login",
-    response_model=schemas.ProfessionalResponse,
-)
-def login(creds: schemas.ProfessionalLogin, db: Session = Depends(get_db)):
-    prof = db.query(models.ProfessionalModel).filter(models.ProfessionalModel.email == creds.email).first()
-    password_valid = False
-    if prof and prof.password_hash:
-        stored_hash_bytes = prof.password_hash.encode("utf-8")
-        if prof.password_hash.startswith(("$2a$", "$2b$", "$2y$")):
-            password_bytes = creds.password.encode("utf-8")[:72]
-            try:
-                password_valid = bcrypt.checkpw(password_bytes, stored_hash_bytes)
-            except ValueError:
-                password_valid = False
-        else:
-            # Migrate passwords stored in plaintext by the previous implementation.
-            password_valid = hmac.compare_digest(
-                stored_hash_bytes,
-                creds.password.encode("utf-8"),
-            )
-            if password_valid:
-                prof.password_hash = hash_password(creds.password)
-                db.commit()
-
-    if not password_valid:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="E-mail ou senha inválidos")
-
-    return professional_response(prof)
-
-@app.post("/api/v1/auth/google")
-def google_login(data: schemas.GoogleLoginRequest, db: Session = Depends(get_db)):
-    firebase_app = get_firebase_app()
-    try:
-        decoded_token = auth.verify_id_token(
-            data.idToken,
-            app=firebase_app,
-            check_revoked=True,
-        )
-    except (auth.InvalidIdTokenError, auth.UserDisabledError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token Firebase inválido ou expirado",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
-    except exceptions.FirebaseError as exc:
-        logger.exception("Não foi possível validar o token de login Google")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Não foi possível validar o token no Firebase",
-        ) from exc
-
-    firebase_uid = decoded_token.get("uid")
-    email = decoded_token.get("email")
-    if not firebase_uid:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token Firebase inválido ou expirado",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    matching_user = (
-        db.query(models.ProfessionalModel)
-        .filter(
-            or_(
-                models.ProfessionalModel.firebase_uid == firebase_uid,
-                models.ProfessionalModel.email == email,
-            )
-        )
-        .first()
-        if email
-        else db.query(models.ProfessionalModel)
-        .filter(models.ProfessionalModel.firebase_uid == firebase_uid)
-        .first()
-    )
-    if matching_user is not None:
-        return professional_response(matching_user)
-
-    return {
-        "status": "needs_registration",
-        "email": email,
-        "firebaseUid": firebase_uid,
-    }
 
 @app.post("/api/v1/subscription/verify")
 def verify_subscription(
@@ -392,6 +349,7 @@ def verify_subscription(
         "status": "success",
         "message": "Assinatura ativada com sucesso",
         "subscriptionExpiresAt": expiration,
+        "bloquear_app": is_subscription_expired(current_user),
     }
 
 
@@ -796,23 +754,6 @@ def update_profile(
         ) from exc
 
     return professional_response(current_user)
-
-@app.post("/api/v1/auth/validate-reset")
-def validate_reset(data: schemas.ResetValidation, db: Session = Depends(get_db)):
-    professional = (
-        db.query(models.ProfessionalModel)
-        .filter(
-            models.ProfessionalModel.cpf == data.cpf,
-            models.ProfessionalModel.email == data.email,
-        )
-        .first()
-    )
-    if professional is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="CPF ou E-mail incorretos",
-        )
-    return {"message": "Dados validados com sucesso"}
 
 @app.delete("/api/v1/auth/delete-account")
 def delete_account(

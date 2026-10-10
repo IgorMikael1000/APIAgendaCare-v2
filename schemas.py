@@ -1,21 +1,31 @@
 from datetime import datetime
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 from typing import Optional, Dict, Any
 from typing import Literal
 
 class ProfessionalCreate(BaseModel):
     id: str = Field(min_length=1)
-    deviceId: str = Field(min_length=1)
-    firebaseUid: Optional[str] = None
+    android_id: str = Field(
+        min_length=6,
+        max_length=255,
+        validation_alias=AliasChoices("android_id", "androidId", "deviceId"),
+    )
     name: str
     email: str
     specialty: str
     specialtyId: Optional[str] = None
     professionalRegister: Optional[str] = None
     cpf: str = Field(min_length=1)
-    password: str
     phone: Optional[str] = None
     signatureUrl: Optional[str] = None
+
+    @field_validator("android_id", mode="before")
+    @classmethod
+    def normalize_android_id(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
 
 class ProfessionalResponse(BaseModel):
     id: str
@@ -29,16 +39,10 @@ class ProfessionalResponse(BaseModel):
     subscriptionExpiresAt: Optional[str] = None
     expirationDate: Optional[str] = None
     isSubscriptionExpired: bool
+    bloquear_app: bool
     specialtyId: Optional[str] = None
     professionalRegister: Optional[str] = None
     phone: Optional[str] = None
-
-class ProfessionalLogin(BaseModel):
-    email: str
-    password: str
-
-class GoogleLoginRequest(BaseModel):
-    idToken: str
 
 class UserProfileUpdate(BaseModel):
     name: Optional[str] = None
@@ -111,10 +115,6 @@ class GooglePlaySubscriptionDetails(BaseModel):
     externalAccountIdentifiers: Optional[GooglePlayExternalAccountIdentifiers] = None
     lineItems: list[GooglePlayLineItem]
 
-
-class ResetValidation(BaseModel):
-    cpf: str
-    email: str
 
 class AppointmentSchema(BaseModel):
     id: str = Field(min_length=1)
