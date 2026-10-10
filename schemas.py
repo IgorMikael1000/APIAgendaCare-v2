@@ -69,7 +69,10 @@ class UserProfileUpdate(BaseModel):
     )
 
 class SubscriptionVerifyRequest(BaseModel):
-    purchaseToken: str
+    purchaseToken: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("purchaseToken", "purchase_token"),
+    )
     planType: Literal["MONTHLY", "QUARTERLY", "SEMIANNUAL", "ANNUAL"]
 
 

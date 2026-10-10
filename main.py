@@ -553,21 +553,29 @@ def google_play_webhook(
         if subscription.externalAccountIdentifiers is not None
         else None
     )
-    user_filters = [
-        models.ProfessionalModel.purchase_token.in_(linked_tokens)
-    ]
+    professional = None
     if account_id:
-        user_filters.extend(
-            [
-                models.ProfessionalModel.id == account_id,
-                models.ProfessionalModel.firebase_uid == account_id,
-            ]
+        professional = (
+            db.query(models.ProfessionalModel)
+            .filter(
+                models.ProfessionalModel.firebase_uid == account_id
+            )
+            .first()
         )
-    professional = (
-        db.query(models.ProfessionalModel)
-        .filter(or_(*user_filters))
-        .first()
-    )
+        if professional is None:
+            professional = (
+                db.query(models.ProfessionalModel)
+                .filter(models.ProfessionalModel.id == account_id)
+                .first()
+            )
+    if professional is None:
+        professional = (
+            db.query(models.ProfessionalModel)
+            .filter(
+                models.ProfessionalModel.purchase_token.in_(linked_tokens)
+            )
+            .first()
+        )
     if professional is None:
         logger.warning(
             "Nenhum profissional corresponde à notificação Google Play "
