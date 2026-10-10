@@ -35,7 +35,7 @@ import models
 import schemas
 from schemas import AppointmentSchema, EvolutionRecordSchema
 
-# Cria tabelas novas e aplica alterações aditivas às tabelas existentes.
+# Cria tabelas novas e aplica alterações aditivas às tabelas existentes
 create_or_update_schema()
 
 app = FastAPI(title="AgendaCare API", version="1.0.0")
