@@ -122,6 +122,26 @@ def get_current_user(
         )
     return current_user
 
+
+def delete_firebase_user_after_trial_rejection(firebase_uid: str) -> None:
+    try:
+        auth.delete_user(firebase_uid, app=get_firebase_app())
+    except auth.UserNotFoundError:
+        logger.info(
+            "Usuário Firebase %s já foi removido após bloqueio do trial",
+            firebase_uid,
+        )
+    except exceptions.FirebaseError as exc:
+        logger.exception(
+            "Não foi possível remover o usuário Firebase %s após bloqueio do trial",
+            firebase_uid,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Não foi possível remover a conta Firebase bloqueada",
+        ) from exc
+
+
 def professional_response(prof: models.ProfessionalModel):
     if not prof.cpf:
         raise HTTPException(
@@ -274,9 +294,10 @@ def register(
         .first()
     )
     if existing_device:
+        delete_firebase_user_after_trial_rejection(firebase_uid)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Este dispositivo já utilizou o período de teste gratuito.",
+            detail="Este dispositivo já atingiu o limite de contas para o trial.",
         )
 
     activation_date = datetime.now(timezone.utc)
@@ -314,9 +335,10 @@ def register(
             .first()
         )
         if existing_device:
+            delete_firebase_user_after_trial_rejection(firebase_uid)
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Este dispositivo já utilizou o período de teste gratuito.",
+                detail="Este dispositivo já atingiu o limite de contas para o trial.",
             )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
