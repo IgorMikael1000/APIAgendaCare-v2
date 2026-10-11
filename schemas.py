@@ -3,6 +3,12 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator
 from typing import Optional, Dict, Any
 from typing import Literal
 
+
+class AppSettingsResponse(BaseModel):
+    latest_version_code: int
+    force_update: bool
+
+
 class ProfessionalCreate(BaseModel):
     id: str = Field(min_length=1)
     android_id: str = Field(

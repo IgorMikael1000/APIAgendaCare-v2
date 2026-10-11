@@ -1,5 +1,25 @@
-from sqlalchemy import Column, String, BigInteger, Integer, Text, JSON, DateTime
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Column,
+    String,
+    BigInteger,
+    Integer,
+    Text,
+    JSON,
+    DateTime,
+)
 from database import Base
+
+
+class AppSettingsModel(Base):
+    __tablename__ = "app_settings"
+    __table_args__ = (CheckConstraint("id = 1", name="ck_app_settings_singleton"),)
+
+    id = Column(Integer, primary_key=True)
+    latest_version_code = Column(Integer, nullable=False)
+    force_update = Column(Boolean, nullable=False)
+
 
 class ProfessionalModel(Base):
     __tablename__ = "professionals"

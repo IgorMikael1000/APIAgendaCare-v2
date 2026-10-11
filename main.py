@@ -45,6 +45,28 @@ GOOGLE_PLAY_SERVICE_ACCOUNT_ENV = "GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"
 GOOGLE_PLAY_PACKAGE_ENV = "GOOGLE_PLAY_PACKAGE_NAME"
 
 
+@app.get(
+    "/api/v1/config/version",
+    response_model=schemas.AppSettingsResponse,
+)
+def get_app_version_config(db: Session = Depends(get_db)):
+    settings = (
+        db.query(models.AppSettingsModel)
+        .filter(models.AppSettingsModel.id == 1)
+        .first()
+    )
+    if settings is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Configuração de versão do aplicativo indisponível",
+        )
+
+    return {
+        "latest_version_code": settings.latest_version_code,
+        "force_update": settings.force_update,
+    }
+
+
 def get_firebase_app():
     try:
         return firebase_admin.get_app()

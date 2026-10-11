@@ -101,6 +101,18 @@ def create_or_update_schema():
         inspector = inspect(connection)
         preparer = connection.dialect.identifier_preparer
 
+        if inspector.has_table("app_settings"):
+            connection.execute(
+                text(
+                    "INSERT INTO app_settings "
+                    "(id, latest_version_code, force_update) "
+                    "SELECT 1, 21, TRUE "
+                    "WHERE NOT EXISTS ("
+                    "SELECT 1 FROM app_settings WHERE id = 1"
+                    ")"
+                )
+            )
+
         for table in Base.metadata.sorted_tables:
             if not inspector.has_table(table.name):
                 continue
