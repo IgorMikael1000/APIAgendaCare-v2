@@ -3,12 +3,13 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateColumn
 
 # A URL do PostgreSQL deve ser configurada na variável de ambiente DATABASE_URL.
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://usuario:senha@host/dbname?sslmode=require")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
+engine = create_engine(DATABASE_URL, poolclass=NullPool)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
