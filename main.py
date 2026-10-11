@@ -3,7 +3,7 @@ import binascii
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Optional
 from urllib.parse import quote
@@ -1042,13 +1042,75 @@ def delete_patient(
 )
 def get_appointments(
     professional_id: str = Path(...),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    month: Optional[int] = Query(None, ge=1, le=12),
+    year: Optional[int] = Query(None, ge=1, le=9998),
     db: Session = Depends(get_db),
 ):
-    appointments = (
-        db.query(models.AppointmentModel)
-        .filter(models.AppointmentModel.professional_id == professional_id)
-        .all()
+    has_date_range = start_date is not None or end_date is not None
+    has_month_filter = month is not None or year is not None
+    if has_date_range and has_month_filter:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Use start_date/end_date ou month/year, não ambos",
+        )
+    if has_date_range and (start_date is None or end_date is None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe start_date e end_date juntos",
+        )
+    if has_month_filter and (month is None or year is None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Informe month e year juntos",
+        )
+
+    query = db.query(models.AppointmentModel).filter(
+        models.AppointmentModel.professional_id == professional_id
     )
+    if start_date is not None and end_date is not None:
+        if end_date < start_date:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="end_date deve ser igual ou posterior a start_date",
+            )
+        if end_date == date.max:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="end_date está fora do intervalo suportado",
+            )
+        range_start = datetime.combine(
+            start_date,
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        )
+        range_end = datetime.combine(
+            end_date + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        )
+    elif month is not None and year is not None:
+        range_start = datetime(year, month, 1, tzinfo=timezone.utc)
+        if month == 12:
+            range_end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+        else:
+            range_end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+    else:
+        range_start = None
+        range_end = None
+
+    if range_start is not None and range_end is not None:
+        query = query.filter(
+            models.AppointmentModel.date_time_epoch
+            >= int(range_start.timestamp()) * 1000,
+            models.AppointmentModel.date_time_epoch
+            < int(range_end.timestamp()) * 1000,
+        )
+
+    appointments = query.order_by(
+        models.AppointmentModel.date_time_epoch
+    ).all()
     return [
         {
             "id": appointment.id,
