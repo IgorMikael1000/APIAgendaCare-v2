@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 from typing import Optional, Dict, Any
@@ -31,6 +32,33 @@ class ProfessionalCreate(BaseModel):
         if isinstance(value, str):
             return value.strip()
         return value
+
+
+class PasswordResetRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    cpf: str = Field(min_length=1, max_length=32)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if (
+            normalized.count("@") != 1
+            or any(character.isspace() for character in normalized)
+            or not all(normalized.split("@"))
+        ):
+            raise ValueError("Informe um e-mail válido")
+        return normalized
+
+    @field_validator("cpf")
+    @classmethod
+    def normalize_cpf(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9.\-/\s]+", value):
+            raise ValueError("Informe um CPF válido")
+        digits = re.sub(r"\D", "", value)
+        if len(digits) != 11:
+            raise ValueError("Informe um CPF válido")
+        return digits
 
 
 class ProfessionalResponse(BaseModel):

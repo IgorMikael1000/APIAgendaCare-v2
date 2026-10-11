@@ -3,6 +3,7 @@ import binascii
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Optional
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 GOOGLE_PLAY_SERVICE_ACCOUNT_ENV = "GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"
 GOOGLE_PLAY_PACKAGE_ENV = "GOOGLE_PLAY_PACKAGE_NAME"
+FIREBASE_WEB_API_KEY_ENV = "FIREBASE_WEB_API_KEY"
 
 
 @app.get(
@@ -413,6 +415,86 @@ def google_login(
             detail="Não existe um profissional vinculado a este usuário Firebase",
         )
     return professional_response(professional)
+
+
+@app.post("/api/v1/auth/password-reset/request")
+def request_password_reset(
+    reset_request: schemas.PasswordResetRequest,
+    db: Session = Depends(get_db),
+):
+    api_key = os.getenv(FIREBASE_WEB_API_KEY_ENV)
+    if not api_key:
+        logger.error(
+            "%s is not configured; password reset is unavailable",
+            FIREBASE_WEB_API_KEY_ENV,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="O serviço de recuperação de senha está indisponível",
+        )
+
+    response_message = (
+        "Se os dados informados corresponderem a uma conta, "
+        "enviaremos instruções para o e-mail cadastrado."
+    )
+    professional = (
+        db.query(models.ProfessionalModel)
+        .filter(
+            func.lower(models.ProfessionalModel.email) == reset_request.email
+        )
+        .first()
+    )
+    if professional is None:
+        return {"message": response_message}
+
+    stored_cpf = re.sub(r"\D", "", professional.cpf or "")
+    if stored_cpf != reset_request.cpf:
+        return {"message": response_message}
+
+    try:
+        firebase_response = requests.post(
+            "https://identitytoolkit.googleapis.com/v1/"
+            f"accounts:sendOobCode?key={quote(api_key, safe='')}",
+            json={
+                "requestType": "PASSWORD_RESET",
+                "email": professional.email,
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        logger.error(
+            "Firebase password reset request failed (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Não foi possível processar a solicitação. Tente novamente.",
+        ) from exc
+
+    if not firebase_response.ok:
+        try:
+            firebase_error = firebase_response.json().get("error", {}).get("message")
+        except (ValueError, AttributeError):
+            firebase_error = None
+
+        if firebase_error not in {
+            "EMAIL_NOT_FOUND",
+            "INVALID_EMAIL",
+            "USER_DISABLED",
+        }:
+            logger.error(
+                "Firebase password reset endpoint returned HTTP %s",
+                firebase_response.status_code,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    "Não foi possível processar a solicitação. "
+                    "Tente novamente."
+                ),
+            )
+
+    return {"message": response_message}
 
 
 @app.post("/api/v1/subscription/verify")
