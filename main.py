@@ -1324,21 +1324,30 @@ def delete_appointment(
             models.AppointmentModel.id == appointment_id,
         )
 
-    appointment_ids = [
-        row.id for row in appointments_query.with_entities(models.AppointmentModel.id).all()
+    appointments_to_delete = appointments_query.with_for_update().all()
+    deletable_statuses = {"PENDING", "SCHEDULED", "CONFIRMED"}
+    deletable_appointments = [
+        item
+        for item in appointments_to_delete
+        if item.status in deletable_statuses
     ]
+    appointment_ids = [item.id for item in deletable_appointments]
+
     if appointment_ids:
         db.query(models.EvolutionRecordModel).filter(
             models.EvolutionRecordModel.appointment_id.in_(appointment_ids),
         ).delete(synchronize_session=False)
-
-    if delete_all and appointment.recurrence_id is not None:
-        appointments_query.delete(synchronize_session=False)
-    else:
-        db.delete(appointment)
+        appointments_query.filter(
+            models.AppointmentModel.id.in_(appointment_ids),
+            models.AppointmentModel.status.in_(deletable_statuses),
+        ).delete(synchronize_session=False)
 
     db.commit()
-    return {"status": "success"}
+    return {
+        "status": "success",
+        "deletedCount": len(appointment_ids),
+        "preservedCount": len(appointments_to_delete) - len(appointment_ids),
+    }
 
 @app.get(
     "/api/v1/evolutions/{professional_id}",
