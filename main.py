@@ -1379,6 +1379,33 @@ def get_evolutions(
         for evolution in evolutions
     ]
 
+@app.delete(
+    "/api/v1/evolutions/{professional_id}/{evolutionId}",
+    dependencies=[Depends(require_active_professional)],
+)
+def delete_evolution(
+    professional_id: str = Path(...),
+    evolution_id: str = Path(..., alias="evolutionId"),
+    db: Session = Depends(get_db),
+):
+    evolution = (
+        db.query(models.EvolutionRecordModel)
+        .filter(
+            models.EvolutionRecordModel.id == evolution_id,
+            models.EvolutionRecordModel.professional_id == professional_id,
+        )
+        .first()
+    )
+    if evolution is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Evolução não encontrada",
+        )
+
+    db.delete(evolution)
+    db.commit()
+    return {"status": "success"}
+
 @app.post(
     "/api/v1/evolutions/{professional_id}",
     response_model=list[EvolutionRecordSchema],
