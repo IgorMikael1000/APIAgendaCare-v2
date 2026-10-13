@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine, inspect, text
@@ -12,6 +13,79 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://usuario:senha@host/dbname
 engine = create_engine(DATABASE_URL, poolclass=NullPool)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+logger = logging.getLogger(__name__)
+
+PERFORMANCE_INDEX_STATEMENTS = (
+    (
+        "ix_patients_professional_id",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "ix_patients_professional_id "
+        "ON patients USING btree (professional_id)",
+    ),
+    (
+        "ix_appointments_professional_date_time_epoch",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "ix_appointments_professional_date_time_epoch "
+        "ON appointments USING btree (professional_id, date_time_epoch)",
+    ),
+    (
+        "ix_appointments_patient_id",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "ix_appointments_patient_id "
+        "ON appointments USING btree (patient_id)",
+    ),
+    (
+        "ix_evolution_records_professional_date_epoch",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "ix_evolution_records_professional_date_epoch "
+        "ON evolution_records USING btree (professional_id, date_epoch)",
+    ),
+    (
+        "ix_evolution_records_patient_id",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "ix_evolution_records_patient_id "
+        "ON evolution_records USING btree (patient_id)",
+    ),
+    (
+        "ix_evolution_records_appointment_id",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "ix_evolution_records_appointment_id "
+        "ON evolution_records USING btree (appointment_id)",
+    ),
+)
+
+
+def criar_indices_performance():
+    if engine.dialect.name != "postgresql":
+        logger.warning(
+            "Índices de performance não criados: PostgreSQL é necessário "
+            "(dialeto atual: %s)",
+            engine.dialect.name,
+        )
+        return
+
+    try:
+        with engine.connect().execution_options(
+            isolation_level="AUTOCOMMIT"
+        ) as connection:
+            for index_name, statement in PERFORMANCE_INDEX_STATEMENTS:
+                try:
+                    connection.execute(text(statement))
+                except Exception:
+                    logger.exception(
+                        "Falha ao criar o índice de performance %s",
+                        index_name,
+                    )
+                else:
+                    logger.info(
+                        "Índice de performance verificado: %s",
+                        index_name,
+                    )
+    except Exception:
+        logger.exception(
+            "Não foi possível conectar ao banco para verificar índices; "
+            "a API continuará iniciando"
+        )
 
 
 def _migrate_legacy_trial_devices(connection, inspector, preparer):

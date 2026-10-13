@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import binascii
 import json
@@ -29,7 +30,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, or_, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
-from database import get_db
+from database import criar_indices_performance, get_db
 import models
 import schemas
 from schemas import AppointmentSchema, EvolutionRecordSchema
@@ -38,10 +39,28 @@ app = FastAPI(title="AgendaCare API", version="1.0.0")
 bearer_scheme = HTTPBearer(auto_error=False)
 firebase_app_lock = Lock()
 logger = logging.getLogger(__name__)
+startup_tasks: set[asyncio.Task[None]] = set()
 
 GOOGLE_PLAY_SERVICE_ACCOUNT_ENV = "GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"
 GOOGLE_PLAY_PACKAGE_ENV = "GOOGLE_PLAY_PACKAGE_NAME"
 FIREBASE_WEB_API_KEY_ENV = "FIREBASE_WEB_API_KEY"
+
+
+async def _run_performance_index_setup():
+    try:
+        await asyncio.to_thread(criar_indices_performance)
+    except Exception:
+        logger.exception(
+            "Falha inesperada na verificação dos índices; "
+            "a API continuará disponível"
+        )
+
+
+@app.on_event("startup")
+async def schedule_performance_index_setup():
+    task = asyncio.create_task(_run_performance_index_setup())
+    startup_tasks.add(task)
+    task.add_done_callback(startup_tasks.discard)
 
 
 @app.get(
