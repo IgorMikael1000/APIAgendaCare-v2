@@ -29,13 +29,10 @@ from pydantic import ValidationError
 from sqlalchemy import func, or_, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
-from database import create_or_update_schema, get_db
+from database import get_db
 import models
 import schemas
 from schemas import AppointmentSchema, EvolutionRecordSchema
-
-# Cria tabelas novas e aplica alterações aditivas às tabelas existentes.
-create_or_update_schema()
 
 app = FastAPI(title="AgendaCare API", version="1.0.0")
 bearer_scheme = HTTPBearer(auto_error=False)
