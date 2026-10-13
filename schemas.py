@@ -171,6 +171,7 @@ class AppointmentSchema(BaseModel):
         "CANCELLED",
     ]
     notes: Optional[str] = None
+    updatedAt: Optional[datetime] = None
 
 class EvolutionRecordSchema(BaseModel):
     id: str = Field(min_length=1)
@@ -183,6 +184,7 @@ class EvolutionRecordSchema(BaseModel):
     textualEvolution: str
     observations: Optional[str] = None
     customFields: Optional[Dict[str, Any]] = None
+    updatedAt: Optional[datetime] = None
 
 class PatientSchema(BaseModel):
     id: str = Field(min_length=1)
@@ -196,3 +198,4 @@ class PatientSchema(BaseModel):
     relationship: Optional[str] = None
     notes: Optional[str] = None
     createdAtEpochMillis: int
+    updatedAt: Optional[datetime] = None

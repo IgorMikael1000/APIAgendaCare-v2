@@ -52,6 +52,24 @@ PERFORMANCE_INDEX_STATEMENTS = (
         "ix_evolution_records_appointment_id "
         "ON evolution_records USING btree (appointment_id)",
     ),
+    (
+        "ix_patients_updated_at",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "ix_patients_updated_at "
+        "ON patients USING btree (updated_at)",
+    ),
+    (
+        "ix_appointments_updated_at",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "ix_appointments_updated_at "
+        "ON appointments USING btree (updated_at)",
+    ),
+    (
+        "ix_evolution_records_updated_at",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+        "ix_evolution_records_updated_at "
+        "ON evolution_records USING btree (updated_at)",
+    ),
 )
 
 

@@ -8,6 +8,7 @@ from sqlalchemy import (
     Text,
     JSON,
     DateTime,
+    func,
 )
 from database import Base
 
@@ -59,6 +60,13 @@ class PatientModel(Base):
     relationship = Column(String(100))
     notes = Column(Text)
     created_at_epoch = Column(BigInteger, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
 
 class AppointmentModel(Base):
     __tablename__ = "appointments"
@@ -72,6 +80,13 @@ class AppointmentModel(Base):
     duration_minutes = Column(Integer, nullable=False)
     status = Column(String(50), nullable=False)
     notes = Column(Text)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
 
 class EvolutionRecordModel(Base):
     __tablename__ = "evolution_records"
@@ -85,3 +100,10 @@ class EvolutionRecordModel(Base):
     textual_evolution = Column(Text, nullable=False)
     observations = Column(Text)
     custom_fields = Column(JSON)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Optional
@@ -35,7 +36,6 @@ import models
 import schemas
 from schemas import AppointmentSchema, EvolutionRecordSchema
 
-app = FastAPI(title="AgendaCare API", version="1.0.0")
 bearer_scheme = HTTPBearer(auto_error=False)
 firebase_app_lock = Lock()
 logger = logging.getLogger(__name__)
@@ -56,11 +56,33 @@ async def _run_performance_index_setup():
         )
 
 
-@app.on_event("startup")
-async def schedule_performance_index_setup():
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     task = asyncio.create_task(_run_performance_index_setup())
     startup_tasks.add(task)
     task.add_done_callback(startup_tasks.discard)
+    yield
+
+
+app = FastAPI(
+    title="AgendaCare API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+def _require_timezone_aware_updated_since(updated_since: Optional[datetime]):
+    if (
+        updated_since is not None
+        and (
+            updated_since.tzinfo is None
+            or updated_since.utcoffset() is None
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="updated_since deve incluir fuso horário (ISO 8601)",
+        )
 
 
 @app.get(
@@ -1016,9 +1038,16 @@ def delete_account(
 )
 def get_patients(
     professional_id: str,
+    updated_since: Optional[datetime] = Query(None),
     db: Session = Depends(get_db),
 ):
-    patients = db.query(models.PatientModel).filter(models.PatientModel.professional_id == professional_id).all()
+    _require_timezone_aware_updated_since(updated_since)
+    query = db.query(models.PatientModel).filter(
+        models.PatientModel.professional_id == professional_id
+    )
+    if updated_since is not None:
+        query = query.filter(models.PatientModel.updated_at >= updated_since)
+    patients = query.all()
     result = []
     for p in patients:
         result.append({
@@ -1032,7 +1061,8 @@ def get_patients(
             "guardianName": p.guardian_name,
             "relationship": p.relationship,
             "notes": p.notes,
-            "createdAtEpochMillis": p.created_at_epoch
+            "createdAtEpochMillis": p.created_at_epoch,
+            "updatedAt": p.updated_at,
         })
     return result
 
@@ -1098,6 +1128,8 @@ def sync_patient(
         )
         db.add(p)
     db.commit()
+    db.refresh(p)
+    patient.updatedAt = p.updated_at
     return patient
 
 @app.delete(
@@ -1140,12 +1172,14 @@ def delete_patient(
 )
 def get_appointments(
     professional_id: str = Path(...),
+    updated_since: Optional[datetime] = Query(None),
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
     month: Optional[int] = Query(None, ge=1, le=12),
     year: Optional[int] = Query(None, ge=1, le=9998),
     db: Session = Depends(get_db),
 ):
+    _require_timezone_aware_updated_since(updated_since)
     has_date_range = start_date is not None or end_date is not None
     has_month_filter = month is not None or year is not None
     if has_date_range and has_month_filter:
@@ -1167,6 +1201,10 @@ def get_appointments(
     query = db.query(models.AppointmentModel).filter(
         models.AppointmentModel.professional_id == professional_id
     )
+    if updated_since is not None:
+        query = query.filter(
+            models.AppointmentModel.updated_at >= updated_since
+        )
     if start_date is not None and end_date is not None:
         if end_date < start_date:
             raise HTTPException(
@@ -1221,6 +1259,7 @@ def get_appointments(
             "durationMinutes": appointment.duration_minutes,
             "status": appointment.status,
             "notes": appointment.notes,
+            "updatedAt": appointment.updated_at,
         }
         for appointment in appointments
     ]
@@ -1285,11 +1324,13 @@ def sync_appointments(
             detail="Um ou mais pacientes pertencem a outro profissional",
         )
 
+    synced_appointments = []
     for appointment in appointments:
         db_appointment = appointments_by_id.get(appointment.id)
         if db_appointment is None:
             db_appointment = models.AppointmentModel(id=appointment.id)
             db.add(db_appointment)
+            appointments_by_id[appointment.id] = db_appointment
 
         db_appointment.professional_id = professional_id
         db_appointment.patient_id = appointment.patientId
@@ -1300,8 +1341,12 @@ def sync_appointments(
         db_appointment.duration_minutes = appointment.durationMinutes
         db_appointment.status = appointment.status
         db_appointment.notes = appointment.notes
+        synced_appointments.append((appointment, db_appointment))
 
     db.commit()
+    for appointment, db_appointment in synced_appointments:
+        db.refresh(db_appointment)
+        appointment.updatedAt = db_appointment.updated_at
     return appointments
 
 @app.delete(
@@ -1372,13 +1417,18 @@ def delete_appointment(
 )
 def get_evolutions(
     professional_id: str = Path(...),
+    updated_since: Optional[datetime] = Query(None),
     db: Session = Depends(get_db),
 ):
-    evolutions = (
-        db.query(models.EvolutionRecordModel)
-        .filter(models.EvolutionRecordModel.professional_id == professional_id)
-        .all()
+    _require_timezone_aware_updated_since(updated_since)
+    query = db.query(models.EvolutionRecordModel).filter(
+        models.EvolutionRecordModel.professional_id == professional_id
     )
+    if updated_since is not None:
+        query = query.filter(
+            models.EvolutionRecordModel.updated_at >= updated_since
+        )
+    evolutions = query.all()
     return [
         {
             "id": evolution.id,
@@ -1391,6 +1441,7 @@ def get_evolutions(
             "textualEvolution": evolution.textual_evolution,
             "observations": evolution.observations,
             "customFields": evolution.custom_fields,
+            "updatedAt": evolution.updated_at,
         }
         for evolution in evolutions
     ]
@@ -1501,11 +1552,13 @@ def sync_evolutions(
             detail="Um ou mais agendamentos pertencem a outro profissional",
         )
 
+    synced_evolutions = []
     for evolution in evolutions:
         db_evolution = evolutions_by_id.get(evolution.id)
         if db_evolution is None:
             db_evolution = models.EvolutionRecordModel(id=evolution.id)
             db.add(db_evolution)
+            evolutions_by_id[evolution.id] = db_evolution
 
         db_evolution.appointment_id = evolution.appointmentId
         db_evolution.patient_id = evolution.patientId
@@ -1516,6 +1569,10 @@ def sync_evolutions(
         db_evolution.textual_evolution = evolution.textualEvolution
         db_evolution.observations = evolution.observations
         db_evolution.custom_fields = evolution.customFields
+        synced_evolutions.append((evolution, db_evolution))
 
     db.commit()
+    for evolution, db_evolution in synced_evolutions:
+        db.refresh(db_evolution)
+        evolution.updatedAt = db_evolution.updated_at
     return evolutions

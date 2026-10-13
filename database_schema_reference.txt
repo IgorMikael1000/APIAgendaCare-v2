@@ -1,0 +1,154 @@
+AgendaCare API - Referencia de schema para sincronizacao Android/Room
+===============================================================================
+
+Escopo e fonte
+--------------
+Este documento descreve as tres tabelas de sincronizacao solicitadas:
+patients, appointments e evolution_records. Ele foi preparado a partir dos
+modelos SQLAlchemy, da migration Alembic 20261013_updated_at_sync e da lista de
+indices da rotina de inicializacao.
+
+O backend tambem mapeia outras tabelas (entre elas professionals,
+dispositivos_trial e app_settings); elas nao fazem parte do escopo desta
+referencia.
+
+Tipos abaixo descrevem o mapeamento PostgreSQL. Os nomes de colunas sao
+snake_case no banco. IDs sao VARCHAR(255), nao UUID nativo do PostgreSQL.
+
+1. patients
+-----------
+
+Coluna                 Tipo PostgreSQL             Nulabilidade / restricoes
+----------------------  --------------------------  --------------------------
+id                      VARCHAR(255)                NOT NULL, PRIMARY KEY
+professional_id         VARCHAR(255)                NOT NULL
+full_name               VARCHAR(255)                NOT NULL
+mother_name             VARCHAR(255)                NOT NULL
+birth_date_epoch        BIGINT                      NOT NULL
+phone                   VARCHAR(50)                 NULL
+email                   VARCHAR(255)                NULL
+guardian_name           VARCHAR(255)                NULL
+relationship            VARCHAR(100)                NULL
+notes                   TEXT                        NULL
+created_at_epoch        BIGINT                      NOT NULL
+updated_at              TIMESTAMP WITH TIME ZONE    NOT NULL
+
+Indices:
+- Chave primaria em id (indice unico implicito do PostgreSQL).
+- SQLAlchemy declara index=True para id; pode tambem existir ix_patients_id,
+  indice nao unico separado, criado a partir dos metadados.
+- ix_patients_professional_id (B-tree, professional_id), garantido pela rotina
+  de inicializacao com CREATE INDEX CONCURRENTLY IF NOT EXISTS.
+- ix_patients_updated_at (B-tree, updated_at), declarado no modelo e tambem
+  garantido pela rotina de inicializacao. A migration cria esse indice
+  concorrentemente.
+
+2. appointments
+---------------
+
+Coluna                 Tipo PostgreSQL             Nulabilidade / restricoes
+----------------------  --------------------------  --------------------------
+id                      VARCHAR(255)                NOT NULL, PRIMARY KEY
+professional_id         VARCHAR(255)                NOT NULL
+patient_id              VARCHAR(255)                NOT NULL
+patient_name            VARCHAR(255)                NOT NULL
+recurrence_id           VARCHAR(255)                NULL
+recurrence_rule_id      VARCHAR(255)                NULL
+date_time_epoch         BIGINT                      NOT NULL
+duration_minutes        INTEGER                     NOT NULL
+status                  VARCHAR(50)                 NOT NULL
+notes                   TEXT                        NULL
+updated_at              TIMESTAMP WITH TIME ZONE    NOT NULL
+
+Indices:
+- Chave primaria em id (indice unico implicito do PostgreSQL).
+- SQLAlchemy declara index=True para id; pode tambem existir ix_appointments_id,
+  indice nao unico separado, criado a partir dos metadados.
+- ix_appointments_professional_date_time_epoch (B-tree composto,
+  professional_id, date_time_epoch), garantido pela rotina de inicializacao.
+- ix_appointments_patient_id (B-tree, patient_id), garantido pela rotina de
+  inicializacao.
+- ix_appointments_updated_at (B-tree, updated_at), declarado no modelo e
+  garantido pela rotina de inicializacao; a migration cria esse indice
+  concorrentemente.
+
+3. evolution_records
+--------------------
+
+Coluna                 Tipo PostgreSQL             Nulabilidade / restricoes
+----------------------  --------------------------  --------------------------
+id                      VARCHAR(255)                NOT NULL, PRIMARY KEY
+appointment_id          VARCHAR(255)                NULL
+patient_id              VARCHAR(255)                NOT NULL
+professional_id         VARCHAR(255)                NOT NULL
+date_epoch              BIGINT                      NOT NULL
+activity_performed      TEXT                        NOT NULL
+performance_metrics     TEXT                        NULL
+textual_evolution       TEXT                        NOT NULL
+observations            TEXT                        NULL
+custom_fields           JSON                        NULL
+updated_at              TIMESTAMP WITH TIME ZONE    NOT NULL
+
+Indices:
+- Chave primaria em id (indice unico implicito do PostgreSQL).
+- SQLAlchemy declara index=True para id; pode tambem existir
+  ix_evolution_records_id, indice nao unico separado, criado a partir dos
+  metadados.
+- ix_evolution_records_professional_date_epoch (B-tree composto,
+  professional_id, date_epoch), garantido pela rotina de inicializacao.
+- ix_evolution_records_patient_id (B-tree, patient_id), garantido pela rotina
+  de inicializacao.
+- ix_evolution_records_appointment_id (B-tree, appointment_id), garantido
+  pela rotina de inicializacao.
+- ix_evolution_records_updated_at (B-tree, updated_at), declarado no modelo e
+  garantido pela rotina de inicializacao; a migration cria esse indice
+  concorrentemente.
+
+Chaves estrangeiras e validacao
+-------------------------------
+Os modelos SQLAlchemy atuais nao declaram ForeignKey para professional_id,
+patient_id ou appointment_id. Portanto, neste mapeamento essas colunas nao
+criam restricoes FK no PostgreSQL. As rotas de sincronizacao validam alguns
+relacionamentos e a propriedade do profissional na camada da API; isso nao
+substitui uma constraint FK no banco.
+
+Sincronizacao, timestamps e IDs
+-------------------------------
+- id e uma string opaca VARCHAR(255) usada como chave primaria. O cliente pode
+  enviar o ID que gerou offline (por exemplo, UUID textual); o backend nao
+  converte o valor para o tipo UUID do PostgreSQL.
+- Os endpoints POST de sincronizacao recebem IDs do cliente e fazem insert ou
+  atualizacao por ID. Eles rejeitam IDs duplicados no mesmo lote e verificam
+  se registros encontrados pertencem ao profissional informado.
+- updated_at e um timestamp com fuso horario. A migration o adiciona como
+  NOT NULL com DEFAULT CURRENT_TIMESTAMP, preenchendo os registros existentes
+  durante a aplicacao da migration.
+- Triggers PostgreSQL BEFORE UPDATE atualizam updated_at em cada UPDATE nas
+  tres tabelas. Os modelos tambem declaram server_default=now() e
+  onupdate=now() para operacoes via SQLAlchemy.
+- As listagens aceitam updated_since em formato ISO 8601 com fuso horario e
+  retornam registros com updated_at >= updated_since. As respostas incluem
+  updatedAt em ISO 8601.
+- BIGINT representa um inteiro de 64 bits (Room: Long). birth_date_epoch e
+  created_at_epoch sao enviados pela API com nomes que indicam milissegundos.
+  date_time_epoch tambem e usado em milissegundos nos filtros da agenda. Para
+  date_epoch, o modelo define apenas BIGINT; confirme a unidade esperada pelo
+  cliente/dominio antes de mapear ou converter.
+- Para Room, TIMESTAMP WITH TIME ZONE pode ser guardado como epoch em Long ou
+  texto ISO 8601 UTC, desde que a conversao seja consistente. A API espera
+  timezone em updated_since; timestamps sem fuso sao rejeitados.
+
+Observacoes operacionais
+------------------------
+- Os indices criados por CREATE INDEX CONCURRENTLY evitam o bloqueio de
+  escrita exclusivo mantido por CREATE INDEX normal durante a construcao, mas
+  ainda podem consumir CPU, I/O e tempo de conexao.
+- A migration Alembic deve ser aplicada antes de publicar codigo que consulte
+  updated_at. A rotina de inicializacao cria indices, mas nao adiciona as
+  colunas updated_at.
+- updated_since incremental nao comunica exclusoes. Para manter o espelho
+  local sincronizado apos remocoes, sera necessario um mecanismo de tombstones
+  ou outro feed de exclusoes.
+- Indices podem variar se o banco tiver sido modificado manualmente. Esta
+  referencia descreve o schema e os indices definidos pelo codigo/migrations,
+  nao uma introspeccao direta do banco Neon.
