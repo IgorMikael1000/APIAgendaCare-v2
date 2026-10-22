@@ -8,6 +8,7 @@ from sqlalchemy import (
     Text,
     JSON,
     DateTime,
+    ForeignKey,
     func,
 )
 from database import Base
@@ -39,6 +40,17 @@ class ProfessionalModel(Base):
     cpf = Column(String(20), unique=True, nullable=False)
     phone = Column(String(50), unique=True)
     signature_url = Column(Text)
+
+
+class SubscriptionPurchaseTokenModel(Base):
+    __tablename__ = "subscription_purchase_tokens"
+    purchase_token = Column(String(512), primary_key=True)
+    professional_id = Column(
+        String(255),
+        ForeignKey("professionals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
 
 
 class TrialDeviceModel(Base):

@@ -14,6 +14,7 @@ from urllib.parse import quote
 import firebase_admin
 import google.auth
 from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import id_token as google_id_token
 from google.oauth2 import service_account
 import requests
 from firebase_admin import auth, credentials, exceptions
@@ -43,8 +44,29 @@ startup_tasks: set[asyncio.Task[None]] = set()
 
 GOOGLE_PLAY_SERVICE_ACCOUNT_ENV = "GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"
 GOOGLE_PLAY_PACKAGE_ENV = "GOOGLE_PLAY_PACKAGE_NAME"
+GOOGLE_PLAY_PUBSUB_AUDIENCE_ENV = "GOOGLE_PLAY_PUBSUB_AUDIENCE"
+GOOGLE_PLAY_PUBSUB_SERVICE_ACCOUNT_ENV = (
+    "GOOGLE_PLAY_PUBSUB_SERVICE_ACCOUNT_EMAIL"
+)
 FIREBASE_WEB_API_KEY_ENV = "FIREBASE_WEB_API_KEY"
 
+GOOGLE_PLAY_PRODUCT_PLANS = {
+    "plan_monthly": "MONTHLY",
+    "plan_quarterly": "QUARTERLY",
+    "plan_semiannual": "SEMIANNUAL",
+    "plan_annual": "ANNUAL",
+}
+GOOGLE_PLAY_SUBSCRIPTION_STATUSES = {
+    "SUBSCRIPTION_STATE_ACTIVE": "ACTIVE",
+    "SUBSCRIPTION_STATE_IN_GRACE_PERIOD": "ACTIVE",
+    "SUBSCRIPTION_STATE_CANCELED": "CANCELED",
+    "SUBSCRIPTION_STATE_ON_HOLD": "ON_HOLD",
+    "SUBSCRIPTION_STATE_PAUSED": "PAUSED",
+    "SUBSCRIPTION_STATE_EXPIRED": "EXPIRED",
+    "SUBSCRIPTION_STATE_PENDING": "PENDING",
+    "SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED": "EXPIRED",
+}
+ACCESSIBLE_SUBSCRIPTION_STATUSES = {"ACTIVE", "CANCELED"}
 
 async def _run_performance_index_setup():
     try:
@@ -233,9 +255,17 @@ def subscription_expiration(
     subscription_status = (prof.subscription_status or "").upper()
     if subscription_status == "TRIAL":
         return prof.trial_ends_at
-    if subscription_status == "ACTIVE":
+    if subscription_status in {
+        "ACTIVE",
+        "CANCELED",
+        "IN_GRACE_PERIOD",
+        "ON_HOLD",
+        "PAUSED",
+        "PENDING",
+        "EXPIRED",
+    }:
         return prof.subscription_expires_at
-    return prof.subscription_expires_at or prof.trial_ends_at
+    return None
 
 
 def is_subscription_expired(
@@ -243,15 +273,292 @@ def is_subscription_expired(
     now: Optional[datetime] = None,
 ) -> bool:
     subscription_status = (prof.subscription_status or "").upper()
-    if subscription_status not in {"TRIAL", "ACTIVE", "CANCELED"}:
+    if subscription_status == "TRIAL":
+        expiration = prof.trial_ends_at
+    elif subscription_status in ACCESSIBLE_SUBSCRIPTION_STATUSES:
+        expiration = prof.subscription_expires_at
+    else:
         return True
 
-    expiration = subscription_expiration(prof)
     if expiration is None:
         return True
 
     current_time = _as_utc(now or datetime.now(timezone.utc))
     return _as_utc(expiration) <= current_time
+
+
+def google_play_subscription_snapshot(
+    subscription: schemas.GooglePlaySubscriptionDetails,
+) -> tuple[str, str, Optional[datetime]]:
+    try:
+        subscription_status = GOOGLE_PLAY_SUBSCRIPTION_STATUSES[
+            subscription.subscriptionState
+        ]
+    except KeyError as exc:
+        logger.error(
+            "Estado de assinatura Google Play não suportado: %s",
+            subscription.subscriptionState,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Estado de assinatura da Google Play não reconhecido",
+        ) from exc
+
+    if len(subscription.lineItems) != 1:
+        logger.error(
+            "Google Play retornou uma assinatura com quantidade inesperada "
+            "de itens de linha: %s",
+            len(subscription.lineItems),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="A resposta da Google Play contém itens de plano ambíguos",
+        )
+
+    line_item = subscription.lineItems[0]
+    plan_type = GOOGLE_PLAY_PRODUCT_PLANS.get(line_item.productId)
+    if plan_type is None:
+        logger.error("Produto de assinatura Google Play não reconhecido")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="A Google Play retornou um produto de assinatura não reconhecido",
+        )
+
+    expiration = (
+        _as_utc(line_item.expiryTime)
+        if line_item.expiryTime is not None
+        else None
+    )
+    if subscription_status != "PENDING" and expiration is None:
+        logger.error(
+            "Google Play retornou estado %s sem data de expiração",
+            subscription.subscriptionState,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="A resposta da Google Play não contém uma expiração válida",
+        )
+
+    return subscription_status, plan_type, expiration
+
+
+def _subscription_token_owners(
+    db: Session,
+    purchase_tokens: set[str],
+) -> set[str]:
+    if not purchase_tokens:
+        return set()
+
+    registered_owners = {
+        row.professional_id
+        for row in db.query(models.SubscriptionPurchaseTokenModel)
+        .filter(
+            models.SubscriptionPurchaseTokenModel.purchase_token.in_(
+                purchase_tokens
+            )
+        )
+        .all()
+    }
+    legacy_owners = {
+        row.id
+        for row in db.query(models.ProfessionalModel)
+        .filter(
+            models.ProfessionalModel.purchase_token.in_(purchase_tokens)
+        )
+        .all()
+    }
+    return registered_owners | legacy_owners
+
+
+def _external_account_id(
+    subscription: schemas.GooglePlaySubscriptionDetails,
+) -> Optional[str]:
+    if subscription.externalAccountIdentifiers is None:
+        return None
+    return (
+        subscription.externalAccountIdentifiers.obfuscatedExternalAccountId
+    )
+
+
+def _resolve_subscription_professional(
+    db: Session,
+    subscription: schemas.GooglePlaySubscriptionDetails,
+    purchase_tokens: set[str],
+) -> models.ProfessionalModel:
+    account_id = _external_account_id(subscription)
+    account_professional = None
+    if account_id:
+        account_professional = (
+            db.query(models.ProfessionalModel)
+            .filter(models.ProfessionalModel.firebase_uid == account_id)
+            .first()
+        )
+
+    token_owners = _subscription_token_owners(db, purchase_tokens)
+    if len(token_owners) > 1:
+        logger.error(
+            "Tokens vinculados a uma notificação pertencem a contas "
+            "diferentes"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Os tokens da assinatura estão associados a contas diferentes",
+        )
+
+    token_owner_id = next(iter(token_owners), None)
+    if (
+        account_professional is not None
+        and token_owner_id is not None
+        and account_professional.id != token_owner_id
+    ):
+        logger.error(
+            "Identificador de conta Google Play não corresponde ao dono "
+            "registrado do token"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A assinatura Google Play está associada a outra conta",
+        )
+
+    professional_id = (
+        account_professional.id
+        if account_professional is not None
+        else token_owner_id
+    )
+    if professional_id is None:
+        logger.warning(
+            "Assinatura Google Play ainda não está associada a um profissional"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A assinatura ainda não pôde ser associada a uma conta",
+            headers={"Retry-After": "60"},
+        )
+
+    professional = (
+        db.query(models.ProfessionalModel)
+        .filter(models.ProfessionalModel.id == professional_id)
+        .with_for_update()
+        .first()
+    )
+    if professional is None:
+        logger.warning(
+            "A conta associada à assinatura Google Play não existe mais"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A conta associada à assinatura ainda não está disponível",
+            headers={"Retry-After": "60"},
+        )
+
+    if account_id and professional.firebase_uid != account_id:
+        logger.error(
+            "Identificador de conta Google Play não corresponde ao "
+            "profissional resolvido"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A assinatura Google Play está associada a outra conta",
+        )
+    return professional
+
+
+def _record_subscription_tokens(
+    db: Session,
+    professional: models.ProfessionalModel,
+    purchase_tokens: set[str],
+) -> None:
+    for purchase_token in purchase_tokens:
+        existing = (
+            db.query(models.SubscriptionPurchaseTokenModel)
+            .filter(
+                models.SubscriptionPurchaseTokenModel.purchase_token
+                == purchase_token
+            )
+            .first()
+        )
+        if existing is not None:
+            if existing.professional_id != professional.id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="O token da assinatura já está associado a outra conta",
+                )
+            continue
+
+        db.add(
+            models.SubscriptionPurchaseTokenModel(
+                purchase_token=purchase_token,
+                professional_id=professional.id,
+            )
+        )
+
+
+def verify_google_play_pubsub_token(
+    bearer_credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+) -> None:
+    audience = os.getenv(GOOGLE_PLAY_PUBSUB_AUDIENCE_ENV)
+    service_account_email = os.getenv(
+        GOOGLE_PLAY_PUBSUB_SERVICE_ACCOUNT_ENV
+    )
+    if not audience or not service_account_email:
+        logger.error(
+            "Autenticação Pub/Sub indisponível: configure %s e %s",
+            GOOGLE_PLAY_PUBSUB_AUDIENCE_ENV,
+            GOOGLE_PLAY_PUBSUB_SERVICE_ACCOUNT_ENV,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Autenticação do webhook Google Play não configurada",
+        )
+    if bearer_credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Autenticação Pub/Sub obrigatória",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            bearer_credentials.credentials,
+            GoogleAuthRequest(),
+            audience=audience,
+        )
+    except google.auth.exceptions.TransportError as exc:
+        logger.error(
+            "Não foi possível validar o token OIDC do Pub/Sub (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Não foi possível validar a autenticação do webhook",
+            headers={"Retry-After": "60"},
+        ) from exc
+    except (ValueError, google.auth.exceptions.GoogleAuthError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token OIDC do Pub/Sub inválido",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    if claims.get("iss") not in {
+        "accounts.google.com",
+        "https://accounts.google.com",
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Emissor do token Pub/Sub inválido",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if (
+        claims.get("email") != service_account_email
+        or claims.get("email_verified") is not True
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Identidade do push Pub/Sub não autorizada",
+        )
 
 
 def require_active_professional(
@@ -537,33 +844,169 @@ def request_password_reset(
     return {"message": response_message}
 
 
-@app.post("/api/v1/subscription/verify")
+@app.post(
+    "/api/v1/subscription/verify",
+    response_model=schemas.ProfessionalResponse,
+)
 def verify_subscription(
     sub_data: schemas.SubscriptionVerifyRequest,
     current_user: models.ProfessionalModel = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    plan_durations = {
-        "MONTHLY": 30,
-        "QUARTERLY": 90,
-        "SEMIANNUAL": 180,
-        "ANNUAL": 365,
-    }
-    expiration = datetime.now(timezone.utc) + timedelta(
-        days=plan_durations[sub_data.planType]
-    )
-    current_user.subscription_status = "ACTIVE"
-    current_user.plan_type = sub_data.planType
-    current_user.subscription_expires_at = expiration
-    current_user.purchase_token = sub_data.purchaseToken
-    db.commit()
+    package_name = os.getenv(GOOGLE_PLAY_PACKAGE_ENV)
+    if not package_name:
+        logger.error("%s não está configurada", GOOGLE_PLAY_PACKAGE_ENV)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Nome do pacote da Google Play não configurado",
+        )
 
-    return {
-        "status": "success",
-        "message": "Assinatura ativada com sucesso",
-        "subscriptionExpiresAt": expiration,
-        "bloquear_app": is_subscription_expired(current_user),
-    }
+    professional = (
+        db.query(models.ProfessionalModel)
+        .filter(models.ProfessionalModel.id == current_user.id)
+        .with_for_update()
+        .first()
+    )
+    if professional is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Profissional não encontrado",
+        )
+    if not professional.firebase_uid or len(professional.firebase_uid) > 64:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A conta não possui um identificador compatível com o Google Play",
+        )
+
+    requested_tokens = {sub_data.purchaseToken}
+    requested_owners = _subscription_token_owners(db, requested_tokens)
+    if requested_owners and requested_owners != {professional.id}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="O token da assinatura já está associado a outra conta",
+        )
+
+    if (
+        professional.purchase_token
+        and professional.purchase_token != sub_data.purchaseToken
+        and requested_owners == {professional.id}
+    ):
+        db.refresh(professional)
+        return professional_response(professional)
+
+    subscription = fetch_google_play_subscription(
+        sub_data.purchaseToken,
+        package_name,
+    )
+    subscription_status, plan_type, expiration = (
+        google_play_subscription_snapshot(subscription)
+    )
+    linked_token = subscription.linkedPurchaseToken
+    subscription_tokens = {sub_data.purchaseToken}
+    if linked_token:
+        subscription_tokens.add(linked_token)
+
+    account_id = _external_account_id(subscription)
+    if account_id and account_id != professional.firebase_uid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="A compra Google Play não pertence à conta autenticada",
+        )
+
+    token_owners = _subscription_token_owners(db, subscription_tokens)
+    if token_owners and token_owners != {professional.id}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A assinatura está associada a outra conta",
+        )
+    if not account_id and not token_owners:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Não foi possível confirmar o vínculo da compra à conta",
+        )
+
+    if (
+        sub_data.planType is not None
+        and sub_data.planType != plan_type
+        and requested_owners != {professional.id}
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="O plano informado não corresponde ao produto confirmado pela Google Play",
+        )
+
+    if subscription_status == "PENDING":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A compra ainda está pendente na Google Play",
+        )
+    if subscription_status in {"ON_HOLD", "PAUSED", "EXPIRED"} and (
+        professional.purchase_token != sub_data.purchaseToken
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A Google Play não confirmou uma assinatura com acesso ativo",
+        )
+    if (
+        subscription_status in {"ACTIVE", "CANCELED"}
+        and expiration is not None
+        and expiration <= datetime.now(timezone.utc)
+        and professional.purchase_token != sub_data.purchaseToken
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A assinatura confirmada pela Google Play já expirou",
+        )
+    if (
+        subscription_status == "ACTIVE"
+        and expiration is not None
+        and expiration <= datetime.now(timezone.utc)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="A Google Play retornou uma assinatura ativa já expirada",
+        )
+
+    _record_subscription_tokens(
+        db,
+        professional,
+        subscription_tokens,
+    )
+    professional.plan_type = plan_type
+    professional.subscription_status = subscription_status
+    professional.subscription_expires_at = expiration
+    professional.purchase_token = sub_data.purchaseToken
+    try:
+        db.commit()
+        db.refresh(professional)
+    except IntegrityError as exc:
+        db.rollback()
+        logger.warning(
+            "Conflito ao associar token de assinatura Google Play"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="O token da assinatura já está associado a outra conta",
+        ) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error(
+            "Não foi possível persistir a assinatura confirmada pela "
+            "Google Play (%s)",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Não foi possível salvar a assinatura confirmada",
+        ) from exc
+
+    logger.info(
+        "Assinatura Google Play sincronizada: profissional=%s status=%s plano=%s",
+        professional.id,
+        professional.subscription_status,
+        professional.plan_type,
+    )
+    return professional_response(professional)
 
 
 def fetch_google_play_subscription(
@@ -586,7 +1029,10 @@ def fetch_google_play_subscription(
         )
         credentials.refresh(GoogleAuthRequest())
     except (ValueError, google.auth.exceptions.GoogleAuthError) as exc:
-        logger.exception("Não foi possível obter credencial da Google Play")
+        logger.error(
+            "Não foi possível obter credencial da Google Play (%s)",
+            type(exc).__name__,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Não foi possível autenticar na Google Play Developer API",
@@ -604,6 +1050,23 @@ def fetch_google_play_subscription(
             timeout=(5, 15),
         )
         response.raise_for_status()
+    except requests.HTTPError as exc:
+        upstream_status = (
+            exc.response.status_code if exc.response is not None else None
+        )
+        logger.error(
+            "Google Play Developer API rejeitou a consulta (HTTP %s)",
+            upstream_status,
+        )
+        if upstream_status in {400, 404}:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="A Google Play não reconheceu o token de compra",
+            ) from None
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Não foi possível consultar a assinatura na Google Play",
+        ) from None
     except requests.RequestException as exc:
         logger.error(
             "Consulta à Google Play Developer API falhou (%s)",
@@ -612,21 +1075,28 @@ def fetch_google_play_subscription(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Não foi possível consultar a assinatura na Google Play",
-        ) from exc
+        ) from None
 
     try:
         return schemas.GooglePlaySubscriptionDetails.model_validate(
             response.json()
         )
     except (ValueError, ValidationError) as exc:
-        logger.exception("Resposta inválida da Google Play Developer API")
+        logger.error(
+            "Resposta inválida da Google Play Developer API (%s)",
+            type(exc).__name__,
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="A resposta da Google Play não contém dados válidos",
         ) from exc
 
 
-@app.post("/api/v1/webhooks/google-play", status_code=status.HTTP_200_OK)
+@app.post(
+    "/api/v1/webhooks/google-play",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(verify_google_play_pubsub_token)],
+)
 def google_play_webhook(
     payload: schemas.GooglePubSubPushRequest,
     db: Session = Depends(get_db),
@@ -645,132 +1115,150 @@ def google_play_webhook(
             detail="Payload inválido do Google Pub/Sub",
         ) from exc
 
-    subscription_notification = notification.subscriptionNotification
-    if subscription_notification is None:
-        return {"status": "acknowledged"}
-
-    package_name = (
-        notification.packageName or os.getenv(GOOGLE_PLAY_PACKAGE_ENV)
-    )
+    package_name = os.getenv(GOOGLE_PLAY_PACKAGE_ENV)
     if not package_name:
         logger.error("%s não está configurada", GOOGLE_PLAY_PACKAGE_ENV)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Nome do pacote da Google Play não configurado",
+        )
+    if notification.packageName != package_name:
+        logger.warning(
+            "Notificação Pub/Sub rejeitada por divergência de pacote"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pacote da notificação não corresponde a esta API",
+        )
+    if notification.testNotification is not None:
+        if notification.subscriptionNotification is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Notificação de teste contém evento de assinatura",
+            )
+        logger.info(
+            "Notificação de teste Google Play reconhecida: event_id=%s",
+            payload.message.messageId,
+        )
+        return {"status": "acknowledged", "result": "test_notification"}
+
+    subscription_notification = notification.subscriptionNotification
+    if subscription_notification is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Notificação Google Play sem evento reconhecido",
         )
 
     subscription = fetch_google_play_subscription(
         subscription_notification.purchaseToken,
         package_name,
     )
-    plan_types = {
-        "plan_monthly": "MONTHLY",
-        "plan_quarterly": "QUARTERLY",
-        "plan_semiannual": "SEMIANNUAL",
-        "plan_annual": "ANNUAL",
-    }
-    subscription_statuses = {
-        "SUBSCRIPTION_STATE_ACTIVE": "ACTIVE",
-        "SUBSCRIPTION_STATE_IN_GRACE_PERIOD": "ACTIVE",
-        "SUBSCRIPTION_STATE_CANCELED": "CANCELED",
-        "SUBSCRIPTION_STATE_ON_HOLD": "ON_HOLD",
-        "SUBSCRIPTION_STATE_PAUSED": "PAUSED",
-        "SUBSCRIPTION_STATE_EXPIRED": "EXPIRED",
-        "SUBSCRIPTION_STATE_PENDING": "PENDING",
-        "SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED": "EXPIRED",
-    }
-
-    if subscription.subscriptionState not in subscription_statuses:
-        logger.error(
-            "Estado de assinatura Google Play não suportado: %s",
-            subscription.subscriptionState,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Estado de assinatura da Google Play não reconhecido",
-        )
-
-    valid_line_items = [
-        item
-        for item in subscription.lineItems
-        if item.productId in plan_types and item.expiryTime is not None
-    ]
-    if not valid_line_items:
-        logger.error(
-            "Google Play retornou assinatura sem SKU conhecido ou expiração"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="A assinatura da Google Play não contém plano ou expiração válidos",
-        )
-    current_line_item = max(
-        valid_line_items,
-        key=lambda item: item.expiryTime or datetime.min.replace(
-            tzinfo=timezone.utc
-        ),
+    subscription_status, plan_type, expiration = (
+        google_play_subscription_snapshot(subscription)
     )
+    notification_token = subscription_notification.purchaseToken
+    linked_token = subscription.linkedPurchaseToken
+    subscription_tokens = {notification_token}
+    if linked_token:
+        subscription_tokens.add(linked_token)
 
-    linked_tokens = {
-        subscription_notification.purchaseToken,
-        subscription.linkedPurchaseToken,
-    }
-    linked_tokens.discard(None)
-    account_id = (
-        subscription.externalAccountIdentifiers.obfuscatedExternalAccountId
-        if subscription.externalAccountIdentifiers is not None
-        else None
+    professional = _resolve_subscription_professional(
+        db,
+        subscription,
+        subscription_tokens,
     )
-    professional = None
-    if account_id:
-        professional = (
-            db.query(models.ProfessionalModel)
-            .filter(
-                models.ProfessionalModel.firebase_uid == account_id
-            )
-            .first()
+    current_token = professional.purchase_token
+    incoming_owners = _subscription_token_owners(
+        db,
+        {notification_token},
+    )
+    if (
+        current_token
+        and current_token != notification_token
+        and incoming_owners == {professional.id}
+        and linked_token != current_token
+    ):
+        subscription = fetch_google_play_subscription(
+            current_token,
+            package_name,
         )
-        if professional is None:
-            professional = (
-                db.query(models.ProfessionalModel)
-                .filter(models.ProfessionalModel.id == account_id)
-                .first()
-            )
-    if professional is None:
-        professional = (
-            db.query(models.ProfessionalModel)
-            .filter(
-                models.ProfessionalModel.purchase_token.in_(linked_tokens)
-            )
-            .first()
+        subscription_status, plan_type, expiration = (
+            google_play_subscription_snapshot(subscription)
         )
-    if professional is None:
-        logger.warning(
-            "Nenhum profissional corresponde à notificação Google Play "
-            "(subscriptionId=%s)",
-            subscription_notification.subscriptionId,
-        )
-        return {"status": "acknowledged", "result": "professional_not_found"}
+        notification_token = current_token
+        linked_token = subscription.linkedPurchaseToken
+        subscription_tokens = {notification_token}
+        if linked_token:
+            subscription_tokens.add(linked_token)
 
-    professional.purchase_token = subscription_notification.purchaseToken
-    professional.subscription_status = subscription_statuses[
-        subscription.subscriptionState
-    ]
-    professional.plan_type = plan_types[current_line_item.productId]
-    professional.subscription_expires_at = current_line_item.expiryTime
+        current_account_id = _external_account_id(subscription)
+        if (
+            current_account_id
+            and current_account_id != professional.firebase_uid
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A assinatura atual não corresponde à conta vinculada",
+            )
+
+    if subscription_status == "PENDING":
+        logger.info(
+            "Notificação de compra pendente não alterou o acesso: "
+            "event_id=%s event_time_ms=%s event_type=%s",
+            payload.message.messageId,
+            notification.eventTimeMillis,
+            subscription_notification.notificationType,
+        )
+        return {"status": "acknowledged", "result": "purchase_pending"}
+
+    token_owners = _subscription_token_owners(db, subscription_tokens)
+    if token_owners and token_owners != {professional.id}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A assinatura está associada a outra conta",
+        )
+
+    _record_subscription_tokens(db, professional, subscription_tokens)
+    professional.purchase_token = notification_token
+    professional.subscription_status = subscription_status
+    professional.plan_type = plan_type
+    professional.subscription_expires_at = expiration
     try:
         db.commit()
+        db.refresh(professional)
+    except IntegrityError as exc:
+        db.rollback()
+        logger.warning(
+            "Conflito ao associar token recebido em notificação Google Play"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="O token da assinatura já está associado a outra conta",
+        ) from exc
     except SQLAlchemyError as exc:
         db.rollback()
-        logger.exception(
-            "Não foi possível atualizar a assinatura do profissional %s",
-            professional.id,
+        logger.error(
+            "Não foi possível persistir notificação Google Play: "
+            "event_id=%s event_type=%s erro=%s",
+            payload.message.messageId,
+            subscription_notification.notificationType,
+            type(exc).__name__,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Não foi possível atualizar a assinatura",
         ) from exc
 
-    return {"status": "acknowledged"}
+    logger.info(
+        "Notificação Google Play processada: event_id=%s event_type=%s "
+        "event_time_ms=%s status=%s plano=%s",
+        payload.message.messageId,
+        subscription_notification.notificationType,
+        notification.eventTimeMillis,
+        professional.subscription_status,
+        professional.plan_type,
+    )
+    return {"status": "acknowledged", "result": "subscription_synchronized"}
 
 
 def restore_firebase_email(firebase_uid: str, email: str, firebase_app) -> None:
@@ -996,6 +1484,10 @@ def delete_account(
     ).delete(synchronize_session=False)
     db.query(models.PatientModel).filter(
         models.PatientModel.professional_id == current_user.id,
+    ).delete(synchronize_session=False)
+    db.query(models.SubscriptionPurchaseTokenModel).filter(
+        models.SubscriptionPurchaseTokenModel.professional_id
+        == current_user.id,
     ).delete(synchronize_session=False)
     db.query(models.ProfessionalModel).filter(
         models.ProfessionalModel.id == current_user.id,

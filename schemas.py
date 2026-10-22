@@ -107,11 +107,14 @@ class SubscriptionVerifyRequest(BaseModel):
         min_length=1,
         validation_alias=AliasChoices("purchaseToken", "purchase_token"),
     )
-    planType: Literal["MONTHLY", "QUARTERLY", "SEMIANNUAL", "ANNUAL"]
+    planType: Optional[
+        Literal["MONTHLY", "QUARTERLY", "SEMIANNUAL", "ANNUAL"]
+    ] = None
 
 
 class GooglePubSubMessage(BaseModel):
     data: str = Field(min_length=1)
+    messageId: Optional[str] = None
 
 
 class GooglePubSubPushRequest(BaseModel):
@@ -143,7 +146,10 @@ class GooglePlayLineItem(BaseModel):
 
 
 class GooglePlayExternalAccountIdentifiers(BaseModel):
-    obfuscatedExternalAccountId: Optional[str] = None
+    obfuscatedExternalAccountId: Optional[str] = Field(
+        default=None,
+        max_length=64,
+    )
 
 
 class GooglePlaySubscriptionDetails(BaseModel):
