@@ -339,9 +339,12 @@ def register(
     device_was_existing = existing_device is not None
     current_date = datetime.now(timezone.utc)
     if existing_device:
-        activation_date = _as_utc(existing_device.data_ativacao)
+        trial_ends_at = _as_utc(existing_device.data_ativacao) + timedelta(
+            days=7
+        )
     else:
         activation_date = current_date
+        trial_ends_at = activation_date + timedelta(days=7)
         db.add(
             models.TrialDeviceModel(
                 android_id=prof.android_id,
@@ -349,7 +352,6 @@ def register(
             )
         )
 
-    trial_ends_at = activation_date + timedelta(days=7)
     db_prof = models.ProfessionalModel(
         id=prof.id,
         firebase_uid=firebase_uid,
