@@ -185,25 +185,6 @@ def get_current_user(
     return current_user
 
 
-def delete_firebase_user_after_trial_rejection(firebase_uid: str) -> None:
-    try:
-        auth.delete_user(firebase_uid, app=get_firebase_app())
-    except auth.UserNotFoundError:
-        logger.info(
-            "Usuário Firebase %s já foi removido após bloqueio do trial",
-            firebase_uid,
-        )
-    except exceptions.FirebaseError as exc:
-        logger.exception(
-            "Não foi possível remover o usuário Firebase %s após bloqueio do trial",
-            firebase_uid,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Não foi possível remover a conta Firebase bloqueada",
-        ) from exc
-
-
 def professional_response(prof: models.ProfessionalModel):
     if not prof.cpf:
         raise HTTPException(
@@ -351,30 +332,32 @@ def register(
         )
 
     existing_device = (
-        db.query(models.TrialDeviceModel.android_id)
+        db.query(models.TrialDeviceModel)
         .filter(models.TrialDeviceModel.android_id == prof.android_id)
         .first()
     )
+    device_was_existing = existing_device is not None
+    current_date = datetime.now(timezone.utc)
     if existing_device:
-        delete_firebase_user_after_trial_rejection(firebase_uid)
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Este dispositivo já atingiu o limite de contas para o trial.",
+        activation_date = _as_utc(existing_device.data_ativacao)
+    else:
+        activation_date = current_date
+        db.add(
+            models.TrialDeviceModel(
+                android_id=prof.android_id,
+                data_ativacao=activation_date,
+            )
         )
 
-    activation_date = datetime.now(timezone.utc)
-    db.add(
-        models.TrialDeviceModel(
-            android_id=prof.android_id,
-            data_ativacao=activation_date,
-        )
-    )
+    trial_ends_at = activation_date + timedelta(days=7)
     db_prof = models.ProfessionalModel(
         id=prof.id,
         firebase_uid=firebase_uid,
         plan_type="FREE",
-        trial_ends_at=activation_date + timedelta(days=7),
-        subscription_status="TRIAL",
+        trial_ends_at=trial_ends_at,
+        subscription_status=(
+            "TRIAL" if current_date < trial_ends_at else "EXPIRED"
+        ),
         name=prof.name,
         email=firebase_email,
         specialty=prof.specialty,
@@ -389,19 +372,36 @@ def register(
         db.commit()
     except IntegrityError:
         db.rollback()
-        existing_device = (
-            db.query(models.TrialDeviceModel.android_id)
-            .filter(
-                models.TrialDeviceModel.android_id == prof.android_id
+        if not existing_device:
+            existing_device = (
+                db.query(models.TrialDeviceModel)
+                .filter(
+                    models.TrialDeviceModel.android_id == prof.android_id
+                )
+                .first()
             )
-            .first()
-        )
-        if existing_device:
-            delete_firebase_user_after_trial_rejection(firebase_uid)
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Este dispositivo já atingiu o limite de contas para o trial.",
+        if existing_device and not device_was_existing:
+            activation_date = _as_utc(existing_device.data_ativacao)
+            trial_ends_at = activation_date + timedelta(days=7)
+            db_prof.trial_ends_at = trial_ends_at
+            db_prof.subscription_status = (
+                "TRIAL"
+                if datetime.now(timezone.utc) < trial_ends_at
+                else "EXPIRED"
             )
+            db.add(db_prof)
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "E-mail, CPF, telefone, Firebase UID ou ID "
+                        "já cadastrados no sistema"
+                    ),
+                )
+            return professional_response(db_prof)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="E-mail, CPF, telefone, Firebase UID ou ID já cadastrados no sistema",
