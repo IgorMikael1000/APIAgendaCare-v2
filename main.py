@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -227,8 +228,8 @@ def professional_response(prof: models.ProfessionalModel):
         "cpf": prof.cpf,
         "planType": prof.plan_type,
         "subscriptionStatus": prof.subscription_status,
-        "trialEndsAt": format_expiration_date(prof.trial_ends_at),
-        "subscriptionExpiresAt": format_expiration_date(
+        "trialEndsAt": format_expiration_timestamp(prof.trial_ends_at),
+        "subscriptionExpiresAt": format_expiration_timestamp(
             prof.subscription_expires_at
         ),
         "expirationDate": format_expiration_date(expiration),
@@ -241,6 +242,12 @@ def format_expiration_date(value: Optional[datetime]) -> Optional[str]:
     if value is None:
         return None
     return _as_utc(value).date().isoformat()
+
+
+def format_expiration_timestamp(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    return _as_utc(value).isoformat().replace("+00:00", "Z")
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -380,6 +387,24 @@ def _external_account_id(
     )
 
 
+def _professional_subscription_tokens(
+    db: Session,
+    professional: models.ProfessionalModel,
+) -> set[str]:
+    tokens = set(
+        db.query(models.SubscriptionPurchaseTokenModel.purchase_token)
+        .filter(
+            models.SubscriptionPurchaseTokenModel.professional_id
+            == professional.id
+        )
+        .all()
+    )
+    token_values = {row[0] for row in tokens}
+    if professional.purchase_token:
+        token_values.add(professional.purchase_token)
+    return token_values
+
+
 def _resolve_subscription_professional(
     db: Session,
     subscription: schemas.GooglePlaySubscriptionDetails,
@@ -426,9 +451,6 @@ def _resolve_subscription_professional(
         else token_owner_id
     )
     if professional_id is None:
-        logger.warning(
-            "Assinatura Google Play ainda não está associada a um profissional"
-        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="A assinatura ainda não pôde ser associada a uma conta",
@@ -491,6 +513,286 @@ def _record_subscription_tokens(
                 professional_id=professional.id,
             )
         )
+
+
+def _google_play_event_key(message: schemas.GooglePubSubMessage) -> str:
+    event_identity = (
+        f"message:{message.messageId}"
+        if message.messageId
+        else f"data:{message.data}"
+    )
+    return hashlib.sha256(event_identity.encode("utf-8")).hexdigest()
+
+
+def _purchase_token_hash(purchase_token: str) -> str:
+    return hashlib.sha256(purchase_token.encode("utf-8")).hexdigest()
+
+
+def _persist_pending_google_play_event(
+    db: Session,
+    event_key: str,
+    purchase_token: str,
+    notification_type: int,
+    event_time_millis: Optional[str],
+) -> bool:
+    existing = (
+        db.query(models.GooglePlayWebhookEventModel)
+        .filter_by(event_key=event_key)
+        .first()
+    )
+    if existing is not None:
+        return False
+
+    db.add(
+        models.GooglePlayWebhookEventModel(
+            event_key=event_key,
+            purchase_token_hash=_purchase_token_hash(purchase_token),
+            notification_type=notification_type,
+            event_time_millis=event_time_millis,
+            status="PENDING",
+        )
+    )
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if (
+            db.query(models.GooglePlayWebhookEventModel)
+            .filter_by(event_key=event_key)
+            .first()
+            is not None
+        ):
+            return False
+        raise
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+    return True
+
+
+def _mark_pending_google_play_events_processed(
+    db: Session,
+    purchase_tokens: set[str],
+    processed_at: datetime,
+) -> int:
+    if not purchase_tokens:
+        return 0
+
+    token_hashes = {
+        _purchase_token_hash(purchase_token)
+        for purchase_token in purchase_tokens
+    }
+    events = (
+        db.query(models.GooglePlayWebhookEventModel)
+        .filter(
+            models.GooglePlayWebhookEventModel.purchase_token_hash.in_(
+                token_hashes
+            ),
+            models.GooglePlayWebhookEventModel.status == "PENDING",
+        )
+        .with_for_update()
+        .all()
+    )
+    for event in events:
+        event.status = "PROCESSED"
+        event.purchase_token_hash = None
+        event.processed_at = processed_at
+        event.attempt_count += 1
+    return len(events)
+
+
+def _mark_google_play_event_processed(
+    db: Session,
+    event_key: str,
+    notification: schemas.GooglePlaySubscriptionNotification,
+    event_time_millis: Optional[str],
+) -> None:
+    event = (
+        db.query(models.GooglePlayWebhookEventModel)
+        .filter_by(event_key=event_key)
+        .with_for_update()
+        .first()
+    )
+    if event is None:
+        event = models.GooglePlayWebhookEventModel(
+            event_key=event_key,
+            notification_type=notification.notificationType,
+            event_time_millis=event_time_millis,
+            status="PROCESSED",
+            processed_at=datetime.now(timezone.utc),
+            attempt_count=1,
+        )
+        db.add(event)
+    else:
+        event.purchase_token_hash = None
+        event.notification_type = notification.notificationType
+        event.event_time_millis = event_time_millis
+        event.status = "PROCESSED"
+        event.processed_at = datetime.now(timezone.utc)
+        event.attempt_count += 1
+
+
+def _record_rejected_google_play_event(
+    db: Session,
+    event_key: str,
+    notification: schemas.GooglePlaySubscriptionNotification,
+    event_time_millis: Optional[str],
+    reason: str,
+) -> dict[str, str]:
+    event = (
+        db.query(models.GooglePlayWebhookEventModel)
+        .filter_by(event_key=event_key)
+        .with_for_update()
+        .first()
+    )
+    if event is not None and event.status in {"PROCESSED", "REJECTED"}:
+        db.rollback()
+        return {"status": "acknowledged", "result": "duplicate_event"}
+    if event is None:
+        event = models.GooglePlayWebhookEventModel(
+            event_key=event_key,
+            notification_type=notification.notificationType,
+            event_time_millis=event_time_millis,
+            status="REJECTED",
+            processed_at=datetime.now(timezone.utc),
+            attempt_count=1,
+        )
+        db.add(event)
+    else:
+        event.purchase_token_hash = None
+        event.notification_type = notification.notificationType
+        event.event_time_millis = event_time_millis
+        event.status = "REJECTED"
+        event.processed_at = datetime.now(timezone.utc)
+        event.attempt_count += 1
+
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error(
+            "Não foi possível registrar evento Google Play rejeitado: "
+            "event_id=%s erro=%s",
+            event_key,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Não foi possível registrar a notificação Google Play",
+        ) from exc
+
+    logger.warning(
+        "Evento Google Play não aplicado: event_id=%s motivo=%s",
+        event_key,
+        reason,
+    )
+    return {"status": "acknowledged", "result": "rejected_event"}
+
+
+def _reconcile_pending_events_after_verification(
+    db: Session,
+    professional: models.ProfessionalModel,
+    package_name: str,
+) -> int:
+    current_token = professional.purchase_token
+    if not current_token:
+        return 0
+
+    current_tokens = _professional_subscription_tokens(db, professional)
+    pending_hashes = {
+        _purchase_token_hash(token) for token in current_tokens
+    }
+    pending_count = (
+        db.query(models.GooglePlayWebhookEventModel)
+        .filter(
+            models.GooglePlayWebhookEventModel.purchase_token_hash.in_(
+                pending_hashes
+            ),
+            models.GooglePlayWebhookEventModel.status == "PENDING",
+        )
+        .count()
+    )
+    if not pending_count:
+        return 0
+
+    try:
+        subscription = fetch_google_play_subscription(
+            current_token,
+            package_name,
+        )
+    except HTTPException as exc:
+        logger.warning(
+            "Reconciliação RTDN pendente aguardará nova tentativa: "
+            "status=%s",
+            exc.status_code,
+        )
+        raise
+
+    subscription_status, plan_type, expiration = (
+        google_play_subscription_snapshot(subscription)
+    )
+    if subscription_status == "PENDING":
+        return 0
+    if (
+        subscription_status == "ACTIVE"
+        and expiration is not None
+        and expiration <= datetime.now(timezone.utc)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="A Google Play retornou uma assinatura ativa já expirada",
+        )
+
+    account_id = _external_account_id(subscription)
+    if account_id and account_id != professional.firebase_uid:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A assinatura Google Play está associada a outra conta",
+        )
+
+    linked_token = subscription.linkedPurchaseToken
+    if linked_token:
+        current_tokens.add(linked_token)
+    token_owners = _subscription_token_owners(db, current_tokens)
+    if token_owners and token_owners != {professional.id}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A assinatura está associada a outra conta",
+        )
+    if not account_id and token_owners != {professional.id}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Não foi possível confirmar o vínculo da compra à conta",
+        )
+
+    _record_subscription_tokens(db, professional, current_tokens)
+    professional.plan_type = plan_type
+    professional.subscription_status = subscription_status
+    professional.subscription_expires_at = expiration
+    reconciled_count = _mark_pending_google_play_events_processed(
+        db,
+        current_tokens,
+        datetime.now(timezone.utc),
+    )
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error(
+            "Não foi possível persistir reconciliação RTDN: "
+            "erro=%s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Não foi possível atualizar a assinatura",
+        ) from exc
+    db.refresh(professional)
+    logger.info(
+        "Eventos RTDN reconciliados após vínculo: eventos=%s",
+        reconciled_count,
+    )
+    return reconciled_count
 
 
 def verify_google_play_pubsub_token(
@@ -878,7 +1180,8 @@ def verify_subscription(
             detail="A conta não possui um identificador compatível com o Google Play",
         )
 
-    requested_tokens = {sub_data.purchaseToken}
+    requested_token = sub_data.purchaseToken
+    requested_tokens = {requested_token}
     requested_owners = _subscription_token_owners(db, requested_tokens)
     if requested_owners and requested_owners != {professional.id}:
         raise HTTPException(
@@ -886,23 +1189,44 @@ def verify_subscription(
             detail="O token da assinatura já está associado a outra conta",
         )
 
+    token_to_verify = requested_token
     if (
         professional.purchase_token
-        and professional.purchase_token != sub_data.purchaseToken
+        and professional.purchase_token != requested_token
         and requested_owners == {professional.id}
     ):
-        db.refresh(professional)
-        return professional_response(professional)
+        historical_token_hashes = {
+            _purchase_token_hash(token)
+            for token in _professional_subscription_tokens(
+                db,
+                professional,
+            )
+        }
+        has_pending_events = (
+            db.query(models.GooglePlayWebhookEventModel)
+            .filter(
+                models.GooglePlayWebhookEventModel.purchase_token_hash.in_(
+                    historical_token_hashes
+                ),
+                models.GooglePlayWebhookEventModel.status == "PENDING",
+            )
+            .first()
+            is not None
+        )
+        if not has_pending_events:
+            db.refresh(professional)
+            return professional_response(professional)
+        token_to_verify = professional.purchase_token
 
     subscription = fetch_google_play_subscription(
-        sub_data.purchaseToken,
+        token_to_verify,
         package_name,
     )
     subscription_status, plan_type, expiration = (
         google_play_subscription_snapshot(subscription)
     )
     linked_token = subscription.linkedPurchaseToken
-    subscription_tokens = {sub_data.purchaseToken}
+    subscription_tokens = {requested_token, token_to_verify}
     if linked_token:
         subscription_tokens.add(linked_token)
 
@@ -941,7 +1265,7 @@ def verify_subscription(
             detail="A compra ainda está pendente na Google Play",
         )
     if subscription_status in {"ON_HOLD", "PAUSED", "EXPIRED"} and (
-        professional.purchase_token != sub_data.purchaseToken
+        professional.purchase_token != token_to_verify
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -951,7 +1275,7 @@ def verify_subscription(
         subscription_status in {"ACTIVE", "CANCELED"}
         and expiration is not None
         and expiration <= datetime.now(timezone.utc)
-        and professional.purchase_token != sub_data.purchaseToken
+        and professional.purchase_token != token_to_verify
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -975,7 +1299,12 @@ def verify_subscription(
     professional.plan_type = plan_type
     professional.subscription_status = subscription_status
     professional.subscription_expires_at = expiration
-    professional.purchase_token = sub_data.purchaseToken
+    professional.purchase_token = token_to_verify
+    reconciled_events = _mark_pending_google_play_events_processed(
+        db,
+        subscription_tokens,
+        datetime.now(timezone.utc),
+    )
     try:
         db.commit()
         db.refresh(professional)
@@ -1000,11 +1329,18 @@ def verify_subscription(
             detail="Não foi possível salvar a assinatura confirmada",
         ) from exc
 
+    reconciled_events += _reconcile_pending_events_after_verification(
+        db,
+        professional,
+        package_name,
+    )
+
     logger.info(
-        "Assinatura Google Play sincronizada: profissional=%s status=%s plano=%s",
-        professional.id,
+        "Assinatura Google Play sincronizada: status=%s "
+        "plano=%s notificacoes_pendentes_reconciliadas=%s",
         professional.subscription_status,
         professional.plan_type,
+        reconciled_events,
     )
     return professional_response(professional)
 
@@ -1149,10 +1485,39 @@ def google_play_webhook(
             detail="Notificação Google Play sem evento reconhecido",
         )
 
-    subscription = fetch_google_play_subscription(
-        subscription_notification.purchaseToken,
-        package_name,
+    event_key = _google_play_event_key(payload.message)
+    existing_event = (
+        db.query(models.GooglePlayWebhookEventModel)
+        .filter_by(event_key=event_key)
+        .first()
     )
+    if existing_event is not None:
+        if existing_event.status in {"PROCESSED", "REJECTED"}:
+            return {"status": "acknowledged", "result": "duplicate_event"}
+        if not _subscription_token_owners(
+            db,
+            {subscription_notification.purchaseToken},
+        ):
+            return {
+                "status": "acknowledged",
+                "result": "awaiting_account_link",
+            }
+
+    try:
+        subscription = fetch_google_play_subscription(
+            subscription_notification.purchaseToken,
+            package_name,
+        )
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_422_UNPROCESSABLE_ENTITY:
+            raise
+        return _record_rejected_google_play_event(
+            db,
+            event_key,
+            subscription_notification,
+            notification.eventTimeMillis,
+            "purchase_token_not_recognized",
+        )
     subscription_status, plan_type, expiration = (
         google_play_subscription_snapshot(subscription)
     )
@@ -1162,11 +1527,64 @@ def google_play_webhook(
     if linked_token:
         subscription_tokens.add(linked_token)
 
-    professional = _resolve_subscription_professional(
-        db,
-        subscription,
-        subscription_tokens,
-    )
+    try:
+        professional = _resolve_subscription_professional(
+            db,
+            subscription,
+            subscription_tokens,
+        )
+    except HTTPException as exc:
+        if exc.status_code in {
+            status.HTTP_403_FORBIDDEN,
+            status.HTTP_409_CONFLICT,
+        }:
+            return _record_rejected_google_play_event(
+                db,
+                event_key,
+                subscription_notification,
+                notification.eventTimeMillis,
+                "account_association_conflict",
+            )
+        if exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
+            raise
+        try:
+            _persist_pending_google_play_event(
+                db,
+                event_key,
+                notification_token,
+                subscription_notification.notificationType,
+                notification.eventTimeMillis,
+            )
+        except SQLAlchemyError as db_exc:
+            logger.error(
+                "Não foi possível persistir evento Google Play pendente: "
+                "event_id=%s erro=%s",
+                event_key,
+                type(db_exc).__name__,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Não foi possível registrar a notificação Google Play",
+            ) from db_exc
+        try:
+            professional = _resolve_subscription_professional(
+                db,
+                subscription,
+                subscription_tokens,
+            )
+        except HTTPException as retry_exc:
+            if retry_exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
+                raise
+            logger.info(
+                "Notificação Google Play aguardando associação segura: "
+                "event_id=%s",
+                event_key,
+            )
+            return {
+                "status": "acknowledged",
+                "result": "awaiting_account_link",
+            }
+
     current_token = professional.purchase_token
     incoming_owners = _subscription_token_owners(
         db,
@@ -1178,10 +1596,21 @@ def google_play_webhook(
         and incoming_owners == {professional.id}
         and linked_token != current_token
     ):
-        subscription = fetch_google_play_subscription(
-            current_token,
-            package_name,
-        )
+        try:
+            subscription = fetch_google_play_subscription(
+                current_token,
+                package_name,
+            )
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_422_UNPROCESSABLE_ENTITY:
+                raise
+            return _record_rejected_google_play_event(
+                db,
+                event_key,
+                subscription_notification,
+                notification.eventTimeMillis,
+                "current_purchase_token_not_recognized",
+            )
         subscription_status, plan_type, expiration = (
             google_play_subscription_snapshot(subscription)
         )
@@ -1196,16 +1625,39 @@ def google_play_webhook(
             current_account_id
             and current_account_id != professional.firebase_uid
         ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A assinatura atual não corresponde à conta vinculada",
+            return _record_rejected_google_play_event(
+                db,
+                event_key,
+                subscription_notification,
+                notification.eventTimeMillis,
+                "account_association_conflict",
             )
 
     if subscription_status == "PENDING":
+        _mark_google_play_event_processed(
+            db,
+            event_key,
+            subscription_notification,
+            notification.eventTimeMillis,
+        )
+        try:
+            db.commit()
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.error(
+                "Não foi possível registrar evento de compra pendente: "
+                "event_id=%s erro=%s",
+                event_key,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Não foi possível registrar a notificação Google Play",
+            ) from exc
         logger.info(
             "Notificação de compra pendente não alterou o acesso: "
             "event_id=%s event_time_ms=%s event_type=%s",
-            payload.message.messageId,
+            event_key,
             notification.eventTimeMillis,
             subscription_notification.notificationType,
         )
@@ -1213,34 +1665,64 @@ def google_play_webhook(
 
     token_owners = _subscription_token_owners(db, subscription_tokens)
     if token_owners and token_owners != {professional.id}:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="A assinatura está associada a outra conta",
+        return _record_rejected_google_play_event(
+            db,
+            event_key,
+            subscription_notification,
+            notification.eventTimeMillis,
+            "account_association_conflict",
         )
 
-    _record_subscription_tokens(db, professional, subscription_tokens)
+    try:
+        _record_subscription_tokens(db, professional, subscription_tokens)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_409_CONFLICT:
+            raise
+        return _record_rejected_google_play_event(
+            db,
+            event_key,
+            subscription_notification,
+            notification.eventTimeMillis,
+            "account_association_conflict",
+        )
     professional.purchase_token = notification_token
     professional.subscription_status = subscription_status
     professional.plan_type = plan_type
     professional.subscription_expires_at = expiration
+    _mark_google_play_event_processed(
+        db,
+        event_key,
+        subscription_notification,
+        notification.eventTimeMillis,
+    )
     try:
         db.commit()
         db.refresh(professional)
-    except IntegrityError as exc:
+    except IntegrityError:
         db.rollback()
-        logger.warning(
-            "Conflito ao associar token recebido em notificação Google Play"
+        committed_event = (
+            db.query(models.GooglePlayWebhookEventModel)
+            .filter_by(event_key=event_key)
+            .first()
         )
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="O token da assinatura já está associado a outra conta",
-        ) from exc
+        if (
+            committed_event is not None
+            and committed_event.status == "PROCESSED"
+        ):
+            return {"status": "acknowledged", "result": "duplicate_event"}
+        return _record_rejected_google_play_event(
+            db,
+            event_key,
+            subscription_notification,
+            notification.eventTimeMillis,
+            "account_association_conflict",
+        )
     except SQLAlchemyError as exc:
         db.rollback()
         logger.error(
             "Não foi possível persistir notificação Google Play: "
             "event_id=%s event_type=%s erro=%s",
-            payload.message.messageId,
+            event_key,
             subscription_notification.notificationType,
             type(exc).__name__,
         )
@@ -1252,7 +1734,7 @@ def google_play_webhook(
     logger.info(
         "Notificação Google Play processada: event_id=%s event_type=%s "
         "event_time_ms=%s status=%s plano=%s",
-        payload.message.messageId,
+        event_key,
         subscription_notification.notificationType,
         notification.eventTimeMillis,
         professional.subscription_status,

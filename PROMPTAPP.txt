@@ -1,0 +1,104 @@
+INSTRUCOES PARA O AGENTE DO ANDROID STUDIO
+=========================================
+
+Objetivo
+--------
+Atualize o aplicativo Android para interpretar corretamente as datas precisas de
+trial/assinatura retornadas pela API e para manter o acesso de uma assinatura
+cancelada ate o fim do periodo pago. Corrija tambem o fluxo de sincronizacao de
+compra existente conforme necessario para cooperar com a API atualizada.
+
+Contexto confirmado no snapshot do projeto
+-----------------------------------------
+- O perfil recebido da API tem os campos `trialEndsAt`, `subscriptionExpiresAt`,
+  `expirationDate`, `subscriptionStatus`, `isSubscriptionExpired` e `bloquearApp`.
+- Atualmente a API serializa `subscriptionExpiresAt` e `expirationDate` como
+  `AAAA-MM-DD`, descartando a hora e o offset do vencimento.
+- A tela de assinatura calcula os dias usando `LocalDate` e `expirationDate`
+  antes de `subscriptionExpiresAt`.
+- O bloqueio no AuthViewModel considera `CANCELED` sempre expirado.
+- A tela de assinatura tambem apresenta `CANCELED` como "Assinatura Expirada ou
+  Cancelada", mesmo que ainda haja periodo pago.
+- O BillingManager consulta compras existentes ao conectar e envia as compras
+  confirmadas para verificacao na API. O fluxo de compra nova reconhece a compra
+  somente depois da verificacao bem-sucedida.
+- A API e a autoridade sobre status e vencimento; o cliente nao pode calcular
+  nem renovar o periodo por conta propria.
+
+Antes de alterar
+----------------
+1. Inspecione o codigo-fonte Android real e encontre todos os usos dos campos de
+   expiracao, os pontos de bloqueio, a tela de assinatura, armazenamento em
+   cache, DTOs e testes. O snapshot `estrutura_projeto.txt` e apenas uma
+   referencia; nao presuma que ele esteja atualizado.
+2. Confirme o contrato implantado da API. Coordene com a equipe da API para que
+   `subscriptionExpiresAt` e `trialEndsAt` passem a transportar timestamps ISO
+   8601 completos com offset (preferencialmente UTC com `Z`), e nao somente
+   `AAAA-MM-DD`. Durante a transicao, mantenha compatibilidade com respostas
+   antigas date-only.
+3. Nao imprima, registre ou inclua em mensagens de erro purchase tokens, tokens
+   Firebase, dados pessoais ou payloads sensiveis.
+
+Requisitos de implementacao
+---------------------------
+1. Interpretacao de datas
+   - Priorize `subscriptionExpiresAt` para planos pagos e `trialEndsAt` para
+     TRIAL. Use `expirationDate` apenas como fallback retrocompativel.
+   - Parseie timestamps ISO 8601 com `Z` ou offset para um instante (Instant ou
+     equivalente), comparando com o relogio atual em UTC. Nao compare uma data
+     UTC truncada com `LocalDate.now()` para decidir se o acesso expirou.
+   - Mantenha suporte temporario ao formato antigo `AAAA-MM-DD`; documente e
+     teste essa compatibilidade.
+   - Na UI, derive "vence hoje", dias restantes e progresso a partir do prazo
+     real. Evite usar periodos fixos de 30/90/180/365 dias como fonte de
+     entitlement ou validade; meses/calendario e periodos de teste do Google
+     podem ter duracoes diferentes. O servidor continua sendo a autoridade do
+     bloqueio.
+   - Trate data ausente ou invalida de modo seguro e consistente com a resposta
+     autoritativa do servidor; nao invente um novo vencimento.
+
+2. Cancelamento e acesso
+   - `CANCELED` significa que a renovacao foi cancelada, nao que o periodo pago
+     terminou. Nao bloqueie nem mostre "expirada" apenas por esse status.
+   - Enquanto `subscriptionExpiresAt` estiver no futuro e a API informar que a
+     assinatura nao expirou nem esta bloqueada, preserve o acesso e mostre que
+     ela esta cancelada e disponivel ate a data/hora de vencimento.
+   - Bloqueie quando `isSubscriptionExpired` ou `bloquearApp` indicar bloqueio,
+     quando o status for `EXPIRED`, ou quando o vencimento preciso tiver sido
+     atingido. Respeite a semantica do backend para `ON_HOLD`, `PAUSED` e outros
+     estados sem acesso; nao os transforme em status ativo localmente.
+   - Alinhe a mesma regra em login, refresh do perfil, cache offline, tela de
+     assinatura e qualquer gate global do app para nao haver decisoes
+     contraditorias.
+
+3. Compra e notificacoes
+   - Preserve a regra: so reconhecer/acknowledge uma compra depois de a API
+     confirmar a verificacao. Em caso de falha de rede/servidor, mantenha a
+     compra pendente de sincronizacao e permita retry seguro; nao descarte o
+     purchase token nem o registre em logs.
+   - Ao recuperar uma compra existente, envie o token a API para sincronizacao e
+     atualize o perfil/cache com a resposta mais recente.
+   - Se o backend introduzir uma resposta de sincronizacao pendente/retryable
+     para uma notificacao ainda sem conta associada, nao interprete isso como
+     compra ativada. Continue consultando a API quando for seguro.
+
+Testes de aceite
+----------------
+Crie ou atualize testes cobrindo:
+- timestamp UTC, timestamp com offset e horario perto da meia-noite local;
+- vencimento no futuro ainda hoje (nao expirado) e no instante/apos o vencimento
+  (expirado);
+- compatibilidade com `AAAA-MM-DD` durante rollout;
+- `CANCELED` com vencimento futuro continua com acesso e texto de cancelamento;
+- `CANCELED` vencido deixa de ter acesso;
+- `EXPIRED`, `ON_HOLD`, `PAUSED`, `isSubscriptionExpired` e `bloquearApp`
+  mantem a regra do backend;
+- valores ausentes/inválidos sem calculo local de uma validade substituta;
+- perfil atualizado vindo da API substitui corretamente os valores em cache;
+- falha temporaria na verificacao nao reconhece/acknowledge a compra.
+
+Execute os testes e verificacoes Android relevantes (unitarios, lint e build
+quando aplicavel). Ao concluir, reporte arquivos modificados, comportamento
+antes/depois, testes executados e qualquer incompatibilidade encontrada com a
+API implantada. Nao altere o backend, banco de producao, Play Console ou
+configuracao Pub/Sub neste trabalho.

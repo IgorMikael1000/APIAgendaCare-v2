@@ -1,0 +1,138 @@
+INSTRUCOES PARA O AGENTE DA API
+===============================
+
+Objetivo
+--------
+Resolver com seguranca os problemas de sincronizacao Google Play identificados
+nos logs e preparar um contrato de vencimento com precisao suficiente para o
+Android:
+
+1. O webhook Google Play recebe repetidamente HTTP 503 e registra
+   "Assinatura Google Play ainda nao esta associada a um profissional".
+2. O perfil perde hora e fuso do vencimento, pois a API serializa o timestamp
+   como `AAAA-MM-DD`.
+3. O Android precisa distinguir cancelamento de expiracao; a API deve continuar
+   fornecendo status, vencimento e flags coerentes e autoritativos.
+
+Evidencias que motivam o trabalho
+---------------------------------
+- Os exports do Vercel mostram dezenas de HTTP 503 no endpoint
+  `/api/v1/webhooks/google-play` com a mensagem de assinatura ainda nao associada.
+- Ocorrem tambem verificacoes diretas de assinatura e webhooks processados com
+  sucesso; portanto, investigue a ordem/corrida entre RTDN e
+  `/api/v1/subscription/verify` sem presumir falha geral nas credenciais.
+- `_resolve_subscription_professional` atualmente gera 503 quando nao encontra
+  conta pelo `obfuscatedExternalAccountId` nem pelo token associado. O Pub/Sub
+  reenvia respostas nao-2xx, causando repeticao do mesmo evento.
+- `format_expiration_date` transforma `datetime` em data ISO date-only. O
+  endpoint usa essa funcao para `subscriptionExpiresAt`, `trialEndsAt` e
+  `expirationDate`.
+- A API salva a expiração consultada da Google Play; nao substitua essa fonte
+  por prazos calculados localmente para os produtos.
+
+Antes de alterar
+----------------
+1. Leia o codigo atual, migration chain, esquemas, testes e documentacao. A
+   estrutura pode ter mudado; confirme os nomes, estados, dependencias e o
+   contrato atualmente servido antes de editar.
+2. Examine os testes existentes e reproduza o caminho de webhook nao associado.
+   Nao use nem solicite credenciais reais, tokens de compra, dados de pacientes
+   ou acesso ao banco de producao.
+3. Preserve os dados e comportamentos nao relacionados a assinatura.
+4. Nunca escreva purchase tokens, tokens Firebase, segredos ou payloads
+   sensiveis em logs, respostas HTTP ou fixtures publicas.
+
+Requisitos de implementacao
+---------------------------
+1. Resolver notificacoes sem associacao sem retry infinito e sem perder evento
+   - Descubra e teste a causa concreta: verificar dados opcionais retornados
+     pelo Google (`externalAccountIdentifiers`), UID configurado no fluxo de
+     Billing, sincronizacao direta pelo app, backfill da tabela de tokens,
+     corrida entre webhook e verificacao, e implantacao/migration do schema.
+   - Nunca associe compra a um profissional por heuristica insegura (email,
+     CPF, nome, ordem temporal ou apenas produto). So vincule por identidade
+     Google verificada e correspondente ao Firebase UID, ou por token/linked
+     token previamente registrado e pertencente inequivocamente ao mesmo
+     profissional.
+   - Elimine o ciclo de 503 para eventos que nao podem ser associados
+     imediatamente sem descartar a notificacao. Implemente uma solucao
+     duravel/idempotente para receber e reconciliar notificacoes ainda sem
+     perfil (por exemplo, inbox de RTDN pendente com migration e processamento
+     quando `/subscription/verify` registrar com seguranca o token; ou mecanismo
+     equivalente que garanta processamento posterior).
+   - Ao persistir evento pendente, guarde apenas o minimo necessario, proteja o
+     purchase token como dado secreto, garanta unicidade/idempotencia por
+     message ID ou chave equivalente e defina politica de retencao/limpeza.
+     Nao registre o conteudo do evento. Se a gravacao duravel falhar, responda
+     erro retryable para o Pub/Sub. Se o evento foi persistido com sucesso,
+     responda 2xx para encerrar retries e reprocessa-lo quando houver
+     associacao.
+   - No momento da reconciliacao, consulte o estado atual da Google Play pelo
+     token; nao aplique cegamente uma notificacao antiga como estado atual.
+     Proteja contra eventos duplicados/fora de ordem e contra token pertencente
+     a outra conta. Use transacao/locks e unicidade para evitar condicoes de
+     corrida.
+   - Defina observabilidade sem dados sensiveis: contadores/estados de
+     pendentes, idade, tentativas, reconciliacoes e falhas. Nao gere um log
+     repetitivo por cada retry. Mantenha respostas 5xx para falhas transitorias
+     reais (Google indisponivel, banco indisponivel, falha ao persistir).
+   - Documente migration, ordem de deploy, retencao e como inspecionar/reprocessar
+     pendencias com seguranca. Nao execute migrations em banco real.
+
+2. Preservar precisao dos vencimentos no contrato
+   - Continue salvando o `expiryTime` exato fornecido pela Google Play, com
+     timezone correto. Nao some a data atual com 30/90/180/365 dias nem
+     substitua o vencimento de renovacao/teste por uma duracao nominal.
+   - Retorne `subscriptionExpiresAt` e `trialEndsAt` como timestamp ISO 8601
+     completo com offset (preferencialmente UTC `Z`), sem truncar hora/minuto/
+     segundo. Confirme como SQLAlchemy/PostgreSQL normaliza datetime com e sem
+     timezone e converta explicitamente para UTC.
+   - Mantenha `expirationDate` date-only temporariamente se clientes antigos
+     dependerem dele; documente que e legado e derive-o do mesmo instante UTC.
+     O Android atualizado deve priorizar o timestamp completo. Nao altere
+     silenciosamente o significado de campos sem atualizar o contrato.
+   - Para assinatura `CANCELED`, preserve status `CANCELED` e o vencimento pago
+     informado pelo Google. O bloqueio deve continuar baseado na data de
+     expiracao e regras autoritativas do backend, nao no cancelamento isolado.
+     Nao conceda acesso a estados sem acesso como `ON_HOLD`, `PAUSED` ou
+     `EXPIRED`.
+   - Se estados/data ausentes forem inesperados para o estado Google retornado,
+     falhe de forma explicita e segura; nunca use a hora atual como vencimento
+     substituto.
+
+3. Testes e compatibilidade
+   - Adicione testes unitarios/API para:
+     * webhook chega antes da verificacao do app, e e persistido sem retries
+       repetidos, depois reconciliado quando o token e vinculado;
+     * duplicacao, eventos fora de ordem, falha ao persistir, indisponibilidade
+       temporaria da Google API, tokens vinculados a outro profissional e
+       notificacoes sem identidade verificavel;
+     * timestamp de vencimento mantido exatamente no banco e serializado com
+       hora e UTC; datas com offset e limite de expiracao;
+     * `CANCELED` com periodo pago futuro versus expirado, e estados sem acesso;
+     * compatibilidade do campo date-only legado, se mantido.
+   - Atualize schemas/documentacao e todos os produtores/consumidores da
+     representacao do perfil. Procure usages em respostas de login, registro,
+     perfil, verificacao e cache. Nao retorne um contrato diferente apenas em
+     uma rota.
+   - Execute a suite focada, suite relevante completa, compilacao/sintaxe,
+     lint/type-check disponivel e validacao da cadeia Alembic. Teste migration
+     em banco isolado.
+
+Seguranca e rollout
+-------------------
+- Mudancas de schema exigem migration reversivel/documentada e execucao em
+  ambiente de teste primeiro. Nao executar migration nem alterar dados no Neon
+  ou em qualquer banco de producao.
+- Nenhuma verificacao real contra Google Play/Pub/Sub e permitida sem
+  configuracao de teste explicitamente autorizada. Usar mocks e fixtures
+  redigidas.
+- A ordem de deploy deve evitar incompatibilidade: migration antes do codigo que
+  consulta novas tabelas; coordenar o contrato ISO com a atualizacao Android.
+- Nao fazer deploy, alterar secrets/configuracoes do Vercel, criar Pub/Sub, ou
+  acessar Play Console.
+
+Ao concluir, apresente causa comprovada e evidencias, arquivos modificados,
+migrations necessarias, testes executados, riscos e passos de rollout. Separe
+claramente fatos verificados de hipoteses; nao afirme sincronizacao ponta a ponta
+sem teste real autorizado.

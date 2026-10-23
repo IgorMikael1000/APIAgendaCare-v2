@@ -53,6 +53,24 @@ class SubscriptionPurchaseTokenModel(Base):
     )
 
 
+class GooglePlayWebhookEventModel(Base):
+    __tablename__ = "google_play_webhook_events"
+
+    event_key = Column(String(64), primary_key=True)
+    purchase_token_hash = Column(String(64), nullable=True, index=True)
+    notification_type = Column(Integer, nullable=True)
+    event_time_millis = Column(String(32), nullable=True)
+    status = Column(String(20), nullable=False, index=True)
+    received_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        index=True,
+    )
+    processed_at = Column(DateTime(timezone=True), nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+
+
 class TrialDeviceModel(Base):
     __tablename__ = "dispositivos_trial"
     android_id = Column(String(255), primary_key=True)

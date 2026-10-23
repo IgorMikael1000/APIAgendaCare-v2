@@ -147,6 +147,10 @@ class SubscriptionFlowTests(unittest.TestCase):
         self.assertEqual(profile["subscriptionStatus"], "ACTIVE")
         self.assertEqual(
             profile["subscriptionExpiresAt"],
+            expiry.isoformat().replace("+00:00", "Z"),
+        )
+        self.assertEqual(
+            profile["expirationDate"],
             expiry.date().isoformat(),
         )
         self.assertFalse(profile["isSubscriptionExpired"])
@@ -502,6 +506,15 @@ class SubscriptionFlowTests(unittest.TestCase):
         self.professional.subscription_status = "CANCELED"
         self.professional.subscription_expires_at = now + timedelta(days=1)
         self.assertFalse(main.is_subscription_expired(self.professional, now))
+        self.professional.subscription_expires_at = (
+            datetime.now(timezone.utc) + timedelta(days=1)
+        )
+        self.assertFalse(
+            main.professional_response(self.professional)[
+                "isSubscriptionExpired"
+            ]
+        )
+        self.professional.subscription_expires_at = now + timedelta(days=1)
         self.assertTrue(
             main.is_subscription_expired(
                 self.professional,
@@ -528,6 +541,99 @@ class SubscriptionFlowTests(unittest.TestCase):
                 self.professional,
                 now + timedelta(days=1),
             )
+        )
+
+    def test_profile_expiration_timestamps_keep_time_and_normalize_to_utc(self):
+        local_zone = timezone(timedelta(hours=-3))
+        self.professional.trial_ends_at = datetime(
+            2026,
+            10,
+            23,
+            1,
+            15,
+            30,
+            tzinfo=local_zone,
+        )
+        self.professional.subscription_status = "ACTIVE"
+        self.professional.subscription_expires_at = datetime(
+            2026,
+            10,
+            23,
+            1,
+            15,
+            30,
+            tzinfo=local_zone,
+        )
+
+        profile = main.professional_response(self.professional)
+
+        self.assertEqual(
+            profile["trialEndsAt"],
+            "2026-10-23T04:15:30Z",
+        )
+        self.assertEqual(
+            profile["subscriptionExpiresAt"],
+            "2026-10-23T04:15:30Z",
+        )
+        self.assertEqual(profile["expirationDate"], "2026-10-23")
+
+    def test_pending_event_reconciliation_uses_latest_google_state(self):
+        expiry = datetime.now(timezone.utc) + timedelta(days=6)
+        self.professional.purchase_token = "reconcile-token"
+        self.db.add(
+            models.SubscriptionPurchaseTokenModel(
+                purchase_token="reconcile-token",
+                professional_id=self.professional.id,
+            )
+        )
+        self.db.add(
+            models.GooglePlayWebhookEventModel(
+                event_key="a" * 64,
+                purchase_token_hash=main._purchase_token_hash(
+                    "reconcile-token"
+                ),
+                notification_type=2,
+                event_time_millis="1780000000000",
+                status="PENDING",
+            )
+        )
+        self.db.commit()
+
+        latest_subscription = self.make_subscription(
+            state="SUBSCRIPTION_STATE_CANCELED",
+            expiry=expiry,
+        )
+        with patch.object(
+            main,
+            "fetch_google_play_subscription",
+            return_value=latest_subscription,
+        ) as fetch:
+            reconciled = main._reconcile_pending_events_after_verification(
+                self.db,
+                self.professional,
+                "app.itsolutions.agendacare",
+            )
+
+        self.assertEqual(reconciled, 1)
+        fetch.assert_called_once_with(
+            "reconcile-token",
+            "app.itsolutions.agendacare",
+        )
+        self.db.refresh(self.professional)
+        event = self.db.query(
+            models.GooglePlayWebhookEventModel
+        ).one()
+        self.assertEqual(self.professional.subscription_status, "CANCELED")
+        self.assertEqual(
+            self.professional.subscription_expires_at,
+            expiry.replace(tzinfo=None),
+        )
+        self.assertEqual(event.status, "PROCESSED")
+        self.assertIsNone(event.purchase_token_hash)
+        self.assertFalse(
+            main.professional_response(self.professional)[
+                "isSubscriptionExpired"
+            ]
         )
 
     def test_google_grace_period_maps_to_active_and_expiration_is_utc(self):
@@ -736,7 +842,93 @@ class SubscriptionFlowTests(unittest.TestCase):
         fetch.assert_not_called()
         self.assertEqual(self.professional.subscription_status, "TRIAL")
 
-    def test_webhook_unknown_professional_returns_retryable_error(self):
+    def test_unassociated_webhook_is_deferred_and_reconciled_after_verification(self):
+        unmatched = self.make_subscription(account_id="unknown-user")
+        expiry = datetime.now(timezone.utc) + timedelta(days=12)
+        matched = self.make_subscription(expiry=expiry)
+        notification = {
+            "subscriptionNotification": {
+                "version": "1.0",
+                "notificationType": 2,
+                "purchaseToken": "orphan-token",
+                "subscriptionId": "plan_monthly",
+            }
+        }
+        with patch.object(
+            main,
+            "fetch_google_play_subscription",
+            side_effect=[unmatched, matched],
+        ) as fetch:
+            response = self.post_webhook(notification)
+            pending = (
+                self.db.query(models.GooglePlayWebhookEventModel).one()
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(
+                response.json()["result"],
+                "awaiting_account_link",
+            )
+            self.assertEqual(pending.status, "PENDING")
+            self.assertEqual(
+                pending.purchase_token_hash,
+                main._purchase_token_hash("orphan-token"),
+            )
+            self.assertNotEqual(pending.purchase_token_hash, "orphan-token")
+
+            verification = self.verify(
+                token="orphan-token",
+                plan="MONTHLY",
+            )
+
+        self.assertEqual(verification.status_code, 200, verification.text)
+        self.assertEqual(fetch.call_count, 2)
+        self.db.refresh(pending)
+        self.assertEqual(pending.status, "PROCESSED")
+        self.assertIsNone(pending.purchase_token_hash)
+        self.assertIsNotNone(pending.processed_at)
+        self.db.refresh(self.professional)
+        self.assertEqual(self.professional.purchase_token, "orphan-token")
+        self.assertEqual(
+            self.professional.subscription_expires_at,
+            expiry.replace(tzinfo=None),
+        )
+
+    def test_pending_webhook_remains_retryable_after_google_failure(self):
+        unmatched = self.make_subscription(account_id="unknown-user")
+        expiry = datetime.now(timezone.utc) + timedelta(days=8)
+        matched = self.make_subscription(expiry=expiry)
+        notification = {
+            "subscriptionNotification": {
+                "version": "1.0",
+                "notificationType": 2,
+                "purchaseToken": "retry-token",
+                "subscriptionId": "plan_monthly",
+            }
+        }
+        with patch.object(
+            main,
+            "fetch_google_play_subscription",
+            side_effect=[
+                unmatched,
+                main.HTTPException(status_code=502),
+                matched,
+            ],
+        ):
+            webhook = self.post_webhook(notification)
+            failed_verification = self.verify(token="retry-token")
+            pending = self.db.query(
+                models.GooglePlayWebhookEventModel
+            ).one()
+            pending_status_after_failure = pending.status
+            successful_verification = self.verify(token="retry-token")
+
+        self.assertEqual(webhook.status_code, 200, webhook.text)
+        self.assertEqual(failed_verification.status_code, 502)
+        self.assertEqual(pending_status_after_failure, "PENDING")
+        self.assertEqual(pending.status, "PROCESSED")
+        self.assertEqual(successful_verification.status_code, 200)
+
+    def test_duplicate_unassociated_webhook_is_acknowledged_without_google_retry(self):
         subscription = self.make_subscription(account_id="unknown-user")
         notification = {
             "subscriptionNotification": {
@@ -750,10 +942,129 @@ class SubscriptionFlowTests(unittest.TestCase):
             main,
             "fetch_google_play_subscription",
             return_value=subscription,
+        ) as fetch:
+            first = self.post_webhook(notification)
+            duplicate = self.post_webhook(notification)
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(duplicate.status_code, 200, duplicate.text)
+        self.assertEqual(
+            duplicate.json()["result"],
+            "awaiting_account_link",
+        )
+        fetch.assert_called_once()
+        self.assertEqual(
+            self.db.query(models.GooglePlayWebhookEventModel).count(),
+            1,
+        )
+
+    def test_webhook_rechecks_association_after_deferring_for_race(self):
+        subscription = self.make_subscription(account_id="unknown-user")
+        notification = {
+            "subscriptionNotification": {
+                "version": "1.0",
+                "notificationType": 2,
+                "purchaseToken": "race-token",
+                "subscriptionId": "plan_monthly",
+            }
+        }
+        with (
+            patch.object(
+                main,
+                "fetch_google_play_subscription",
+                return_value=subscription,
+            ),
+            patch.object(
+                main,
+                "_resolve_subscription_professional",
+                side_effect=[
+                    main.HTTPException(status_code=503),
+                    self.professional,
+                ],
+            ),
         ):
             response = self.post_webhook(notification)
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.headers.get("retry-after"), "60")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["result"], "subscription_synchronized")
+        event = self.db.query(models.GooglePlayWebhookEventModel).one()
+        self.assertEqual(event.status, "PROCESSED")
+        self.assertIsNone(event.purchase_token_hash)
+
+    def test_webhook_permanent_account_conflict_is_acknowledged_and_deduplicated(self):
+        other = models.ProfessionalModel(
+            id="professional-2",
+            firebase_uid="firebase-user-2",
+            plan_type="FREE",
+            subscription_status="TRIAL",
+            name="Other User",
+            email="other@example.com",
+            specialty="Fonoaudiologia",
+            cpf="10987654321",
+        )
+        self.db.add(other)
+        self.db.add(
+            models.SubscriptionPurchaseTokenModel(
+                purchase_token="owned-by-other",
+                professional_id=other.id,
+            )
+        )
+        self.db.commit()
+
+        notification = {
+            "subscriptionNotification": {
+                "version": "1.0",
+                "notificationType": 2,
+                "purchaseToken": "owned-by-other",
+                "subscriptionId": "plan_monthly",
+            }
+        }
+        with patch.object(
+            main,
+            "fetch_google_play_subscription",
+            return_value=self.make_subscription(),
+        ) as fetch:
+            first = self.post_webhook(notification)
+            duplicate = self.post_webhook(notification)
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["result"], "rejected_event")
+        self.assertEqual(duplicate.status_code, 200, duplicate.text)
+        self.assertEqual(duplicate.json()["result"], "duplicate_event")
+        fetch.assert_called_once()
+        event = self.db.query(models.GooglePlayWebhookEventModel).one()
+        self.assertEqual(event.status, "REJECTED")
+        self.assertIsNone(event.purchase_token_hash)
+
+    def test_webhook_persistence_failure_returns_retryable_error(self):
+        subscription = self.make_subscription(account_id="unknown-user")
+        notification = {
+            "subscriptionNotification": {
+                "version": "1.0",
+                "notificationType": 2,
+                "purchaseToken": "orphan-token",
+                "subscriptionId": "plan_monthly",
+            }
+        }
+        with (
+            patch.object(
+                main,
+                "fetch_google_play_subscription",
+                return_value=subscription,
+            ),
+            patch.object(
+                main,
+                "_persist_pending_google_play_event",
+                side_effect=main.SQLAlchemyError("database unavailable"),
+            ),
+        ):
+            response = self.post_webhook(notification)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            self.db.query(models.GooglePlayWebhookEventModel).count(),
+            0,
+        )
 
     def test_pubsub_oidc_token_requires_expected_audience_and_identity(self):
         with patch.dict(

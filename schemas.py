@@ -69,9 +69,18 @@ class ProfessionalResponse(BaseModel):
     cpf: str
     planType: Optional[str] = None
     subscriptionStatus: Optional[str] = None
-    trialEndsAt: Optional[str] = None
-    subscriptionExpiresAt: Optional[str] = None
-    expirationDate: Optional[str] = None
+    trialEndsAt: Optional[str] = Field(
+        default=None,
+        description="UTC ISO 8601 timestamp with timezone offset",
+    )
+    subscriptionExpiresAt: Optional[str] = Field(
+        default=None,
+        description="UTC ISO 8601 timestamp with timezone offset",
+    )
+    expirationDate: Optional[str] = Field(
+        default=None,
+        description="Legacy UTC date-only value; use timestamp fields instead",
+    )
     isSubscriptionExpired: bool
     bloquear_app: bool
     specialtyId: Optional[str] = None

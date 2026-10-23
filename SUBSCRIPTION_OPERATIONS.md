@@ -26,14 +26,23 @@ Configure a dead-letter topic and alerting for repeated delivery failures.
 
 The migration `20261022_subscription_purchase_tokens` creates the table used to
 associate current and linked purchase tokens and backfills it from existing
-`professionals.purchase_token` values. It does not modify patients, appointments,
-or clinical records.
+`professionals.purchase_token` values. The migration
+`20261023_google_play_webhook_events` adds an idempotent inbox for RTDN events
+that arrive before a purchase can be securely linked to a professional. Neither
+migration modifies patients, appointments, or clinical records.
 
 Back up the database and review the migration plan before deployment. Apply the
-migration before deploying application code that queries
-`subscription_purchase_tokens`; do not run it implicitly on application startup.
-The migration downgrade drops the token-association table, so it should only be
-used when that association data can be discarded or has been backed up.
+migrations before deploying application code that queries
+`subscription_purchase_tokens` and `google_play_webhook_events`; do not run them
+implicitly on application startup. Downgrading the webhook inbox removes
+pending-event and deduplication state. Downgrades should only be used when that
+data can be discarded or has been backed up.
+
+If `subscription_purchase_tokens` was created manually in Neon rather than by
+Alembic, first compare the actual schema with `alembic_version` and reconcile
+the migration history deliberately. Do not run `alembic upgrade head` or stamp a
+revision blindly: the earlier token migration creates that table and can fail
+if it already exists.
 
 Coordinate deployment with the Android application. The verification endpoint
 now returns the same profile representation as login/profile (including
@@ -43,20 +52,78 @@ previous small status/message object. Android should parse the response, keep th
 purchase token for retry after network errors, and acknowledge the purchase only
 after server verification succeeds.
 
+`trialEndsAt` and `subscriptionExpiresAt` are full ISO 8601 timestamps
+normalized to UTC (for example `2026-10-23T04:15:30Z`). `expirationDate`
+remains a legacy UTC date-only field for older clients. Updated clients must use
+the full timestamp fields for expiration decisions. Deploy the compatible
+Android parser before or together with this API contract change.
+
 ## Subscription behavior
 
 - Product IDs map to `MONTHLY`, `QUARTERLY`, `SEMIANNUAL`, and `ANNUAL`; plan and
   expiration are read from Google Play, not calculated from client input.
 - `ACTIVE` and Google `IN_GRACE_PERIOD` are represented as `ACTIVE` and permit
   access until the Google expiry time.
-- `CANCELED` permits access until the already-paid expiry time; cancellation
-  alone does not immediately remove access.
 - `ON_HOLD`, `PAUSED`, `PENDING`, and `EXPIRED` do not grant paid access.
   A pending verification does not replace an existing valid subscription.
 - Trial access is checked against `trial_ends_at`; paid access is checked
   against `subscription_expires_at`. Access expires when the current UTC time is
   greater than or equal to the applicable expiry.
+- `CANCELED` means renewal was cancelled. The user retains paid access until the
+  exact Google Play expiry time; cancellation alone does not revoke access.
 - Unknown Google states or product IDs fail closed and require investigation.
+
+## RTDN inbox and reconciliation
+
+If a webhook cannot yet be matched using the Google obfuscated account ID or an
+already-associated current/linked purchase token, the API stores a minimal
+pending inbox row and acknowledges the Pub/Sub delivery with HTTP 200. It does
+not infer ownership from email, CPF, product, or arrival order. The inbox stores
+only a SHA-256 fingerprint of the purchase token, event metadata, processing
+state, timestamps, and attempt count; the raw token is not copied into this
+table. Existing subscription-token tables remain sensitive and must have
+restricted database access.
+
+When an authenticated `/api/v1/subscription/verify` call securely associates
+the purchase token, linked pending notifications are reconciled in the same
+database transaction as the latest verified subscription state. Reconciliation
+uses the fresh Google Play response from that verification, not the possibly
+stale RTDN payload. Webhooks whose pending token is already associated resume
+processing on a subsequent delivery. Transient failures before an event is
+durably stored return a 5xx so Pub/Sub can retry; failures after persistence
+leave the event pending for a later authenticated verification or delivery.
+Permanent identity/token conflicts and unrecognized purchase tokens are recorded
+as `REJECTED` and acknowledged with HTTP 200, avoiding endless Pub/Sub retries;
+they never change account ownership or subscription state.
+
+Operational checks (do not select or export token fingerprints):
+
+```sql
+SELECT status, COUNT(*) AS event_count,
+       MIN(received_at) AS oldest_received_at
+FROM google_play_webhook_events
+GROUP BY status;
+
+SELECT event_key, notification_type, event_time_millis, received_at,
+       attempt_count
+FROM google_play_webhook_events
+WHERE status = 'PENDING'
+ORDER BY received_at;
+```
+
+Alert on pending events older than 24 hours and investigate the association
+through the authenticated app verification flow. Pending records are not
+automatically deleted so unresolved purchases are not silently lost; review and
+explicitly clean them only after resolving or documenting the case. Processed
+and rejected rows contain no token fingerprint and are retained for 90 days for
+Pub/Sub deduplication. Schedule this cleanup through a reviewed database
+maintenance job:
+
+```sql
+DELETE FROM google_play_webhook_events
+WHERE status IN ('PROCESSED', 'REJECTED')
+  AND processed_at < NOW() - INTERVAL '90 days';
+```
 
 ## Identity and token handling
 
